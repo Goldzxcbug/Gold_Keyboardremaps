@@ -60,6 +60,7 @@ Gold_Keyboardremaps/
 
 - `abi`：选择目标设备架构，默认 `arm64-v8a`；也可构建 `armeabi-v7a` 或 `x86_64`。
 - `publish_release`：默认关闭。关闭时只生成 Actions 构建产物；开启时会创建 GitHub Release 并上传 ZIP 和 SHA-256 校验文件。
+- `prerelease`：仅发布时使用，默认开启，创建测试版；关闭后创建正式版。
 - `release_tag`：仅发布时需要。留空会生成类似 `v1.0-build.123` 的标签。
 
 每个 ZIP 都只包含一种 ABI，请下载与设备架构一致的文件。

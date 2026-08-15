@@ -17,6 +17,11 @@ on:
         required: true
         default: false
         type: boolean
+      prerelease:
+        description: Mark the GitHub Release as a prerelease
+        required: true
+        default: true
+        type: boolean
       release_tag:
         description: Optional release tag; leave empty to generate one
         required: false
@@ -142,10 +147,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
           ARCHIVE: ${{ steps.package.outputs.archive }}
+          PRERELEASE: ${{ inputs.prerelease }}
         shell: bash
         run: |
           set -euo pipefail
+          release_options=()
+          if [ "$PRERELEASE" = "true" ]; then
+            release_options+=(--prerelease)
+          fi
           gh release create "$RELEASE_TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
             --target "$GITHUB_SHA" \
             --title "Gold Keyboard Remaps $RELEASE_TAG" \
-            --generate-notes
+            --generate-notes \
+            "${release_options[@]}"
