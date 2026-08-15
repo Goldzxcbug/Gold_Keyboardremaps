@@ -1,0 +1,151 @@
+name: Manual Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: Android ABI to build
+        required: true
+        default: arm64-v8a
+        type: choice
+        options:
+          - arm64-v8a
+          - armeabi-v7a
+          - x86_64
+      publish_release:
+        description: Create a GitHub Release and attach the module ZIP
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: Optional release tag; leave empty to generate one
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_API: "26"
+      ANDROID_PLATFORM: "35"
+      NDK_VERSION: 27.2.12479018
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platforms;android-35 ndk;27.2.12479018
+
+      - name: Build module
+        id: package
+        env:
+          TARGET_ABI: ${{ inputs.abi }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$TARGET_ABI" in
+            arm64-v8a)
+              target_triple=aarch64-linux-android
+              expected_machine=aarch64
+              ;;
+            armeabi-v7a)
+              target_triple=armv7a-linux-androideabi
+              expected_machine=ARM
+              ;;
+            x86_64)
+              target_triple=x86_64-linux-android
+              expected_machine=x86-64
+              ;;
+            *)
+              echo "Unsupported ABI: $TARGET_ABI" >&2
+              exit 2
+              ;;
+          esac
+
+          ndk_root="$ANDROID_HOME/ndk/$NDK_VERSION"
+          toolchain="$ndk_root/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          compiler="$toolchain/${target_triple}${ANDROID_API}-clang"
+          android_jar="$ANDROID_HOME/platforms/android-$ANDROID_PLATFORM/android.jar"
+
+          test -x "$compiler"
+          test -f "$android_jar"
+
+          rm -rf build
+          mkdir -p build/java-classes build/module/bin
+
+          "$compiler" -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -fPIE -pie \
+            fn_remap.c -o build/module/bin/fn-remap
+          file build/module/bin/fn-remap | grep -F "$expected_machine"
+
+          javac -source 8 -target 8 -cp "$android_jar" -d build/java-classes \
+            ColorOsWindowLauncher.java
+          jar --create --file build/module/bin/coloros-window-launcher.jar \
+            -C build/java-classes .
+
+          install -m 0644 module.prop config.conf build/module/
+          install -m 0755 service.sh action.sh build/module/
+          install -m 0755 keyboardctl build/module/bin/keyboardctl
+          cp -a webroot build/module/
+
+          archive="build/Gold_Keyboardremaps-${TARGET_ABI}.zip"
+          (
+            cd build/module
+            zip -q -r -9 "../$(basename "$archive")" .
+          )
+          unzip -t "$archive"
+          sha256sum "$archive" > "$archive.sha256"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate release metadata
+        id: metadata
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          module_version="$(awk -F= '$1 == "version" { print $2; exit }' module.prop)"
+          if [ -z "$module_version" ]; then
+            echo "module.prop does not define version" >&2
+            exit 1
+          fi
+          tag="$REQUESTED_TAG"
+          if [ -z "$tag" ]; then
+            tag="v${module_version}-build.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Upload module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gold_Keyboardremaps-${{ inputs.abi }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "Gold Keyboard Remaps $RELEASE_TAG" \
+            --generate-notes
