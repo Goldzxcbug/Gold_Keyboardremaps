@@ -22,7 +22,7 @@ fi
 
 if [ -f "$PAUSE_REQUEST" ]; then
     rm -f "$PAUSE_REQUEST"
-    "$MODDIR/bin/keyboardctl" restart
+    /system/bin/sh "$MODDIR/bin/keyboardctl" restart
     update_description "✅ 运行中"
     echo "按键映射已启用。"
 else

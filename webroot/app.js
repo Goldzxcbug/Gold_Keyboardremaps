@@ -1,6 +1,6 @@
 const MODDIR = "/data/adb/modules/Gold_Keyboardremaps";
 const CONFIG_PATH = `${MODDIR}/config.conf`;
-const CONTROL = `${MODDIR}/bin/keyboardctl`;
+const CONTROL = `/system/bin/sh '${MODDIR}/bin/keyboardctl'`;
 const THEME_KEY = "gold_keyboardremaps_theme";
 
 const KEYS = [
@@ -777,7 +777,7 @@ async function applyConfig(button, busyText, readyText, successMessage) {
   button.disabled = true;
   button.textContent = busyText;
   try {
-    await exec(`printf '%s' '${payload}' | base64 -d > '${CONFIG_PATH}' && '${CONTROL}' restart`);
+    await exec(`printf '%s' '${payload}' | base64 -d > '${CONFIG_PATH}' && ${CONTROL} restart`);
     await new Promise((resolve) => setTimeout(resolve, 900));
     await refreshStatus();
     $("#lastApplied").textContent = `已应用 ${new Date().toLocaleTimeString()}`;

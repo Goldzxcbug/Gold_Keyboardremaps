@@ -149,7 +149,7 @@ launch=KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_Q=>com.example.app/.MainActivity|freeform|
 手动修改后，可在 root shell 中重启转发器：
 
 ```sh
-su -c '/data/adb/modules/Gold_Keyboardremaps/bin/keyboardctl restart'
+su -c '/system/bin/sh /data/adb/modules/Gold_Keyboardremaps/bin/keyboardctl restart'
 ```
 
 ## 故障排查
@@ -179,6 +179,14 @@ su -c '/data/adb/modules/Gold_Keyboardremaps/bin/keyboardctl restart'
 ```
 
 如果日志提示无法创建虚拟键盘，请检查内核是否提供 `/dev/uinput`，以及是否有其他输入拦截模块与本模块冲突。
+
+### `keyboardctl: can't execute: Permission denied`
+
+新版模块会通过 `/system/bin/sh` 调用控制脚本，并在开机时修正 `bin` 目录中的执行权限。对于已经安装的旧版本，可先在 root shell 中执行以下命令恢复：
+
+```sh
+su -c 'chmod 0755 /data/adb/modules/Gold_Keyboardremaps/bin/fn-remap /data/adb/modules/Gold_Keyboardremaps/bin/keyboardctl && /system/bin/sh /data/adb/modules/Gold_Keyboardremaps/bin/keyboardctl ensure'
+```
 
 ### 小窗启动失败
 

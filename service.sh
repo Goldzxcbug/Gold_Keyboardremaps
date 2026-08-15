@@ -19,7 +19,8 @@ while [ "$(getprop sys.boot_completed)" != "1" ]; do
     sleep 1
 done
 
-"$MODDIR/bin/keyboardctl" ensure
+chmod 0755 "$MODDIR/bin/fn-remap" "$MODDIR/bin/keyboardctl" 2>/dev/null || true
+/system/bin/sh "$MODDIR/bin/keyboardctl" ensure
 
 if [ -f "$PAUSE_REQUEST" ]; then
     update_description "❌ 已暂停"
