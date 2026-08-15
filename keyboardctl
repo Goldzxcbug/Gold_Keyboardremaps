@@ -1,0 +1,134 @@
+#!/system/bin/sh
+
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/bin}
+CONFIG="$MODDIR/config.conf"
+PAUSE_REQUEST="$MODDIR/paused"
+
+write_defaults() {
+    [ -f "$CONFIG" ] && return 0
+    mkdir -p "$MODDIR"
+    {
+        echo "version=1"
+        echo "device=auto"
+        echo "mapping=KEY_F23=>KEY_FN"
+        echo "mapping=KEY_FN+KEY_1=>KEY_F1"
+        echo "mapping=KEY_FN+KEY_2=>KEY_F2"
+        echo "mapping=KEY_FN+KEY_3=>KEY_F3"
+        echo "mapping=KEY_FN+KEY_4=>KEY_F4"
+        echo "mapping=KEY_FN+KEY_5=>KEY_F5"
+        echo "mapping=KEY_FN+KEY_6=>KEY_F6"
+        echo "mapping=KEY_FN+KEY_7=>KEY_F7"
+        echo "mapping=KEY_FN+KEY_8=>KEY_F8"
+        echo "mapping=KEY_FN+KEY_9=>KEY_F9"
+        echo "mapping=KEY_FN+KEY_0=>KEY_F10"
+        echo "mapping=KEY_FN+KEY_MINUS=>KEY_F11"
+        echo "mapping=KEY_FN+KEY_EQUAL=>KEY_F12"
+        echo "launch=KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_Z=>com.tencent.mobileqq/.activity.SplashActivity|freeform|toggle"
+    } > "$CONFIG"
+}
+
+list_devices() {
+    dumpsys input 2>/dev/null | awk '
+        function flush() {
+            if (classes != "" && path != "" && name !~ /^Gold Keyboardremaps/ &&
+                (classes ~ /EXTERNAL|TOUCH/ || name ~ /[Pp]encil|[Ss]tylus|[Pp]en/)) {
+                print path "\t" name "\t" classes
+            }
+        }
+        /^[[:space:]]*[0-9]+: / {
+            flush()
+            name=$0
+            sub(/^[[:space:]]*[0-9]+: /, "", name)
+            path=""
+            classes=""
+            next
+        }
+        /Classes:/ {
+            classes=$0
+            sub(/^.*Classes: /, "", classes)
+        }
+        /Path: \/dev\/input\/event/ {
+            path=$0
+            sub(/^.*Path: /, "", path)
+        }
+        END { flush() }
+    ' | while IFS="$(printf '\t')" read -r path name classes; do
+        [ -n "$path" ] || continue
+        info="$(getevent -il "$path" 2>/dev/null)"
+        bus="$(printf '%s\n' "$info" | sed -n 's/.*bus:[[:space:]]*\([0-9a-fA-F]*\).*/\1/p' | head -n 1)"
+        vendor="$(printf '%s\n' "$info" | sed -n 's/.*vendor[[:space:]]*\([0-9a-fA-F]*\).*/\1/p' | head -n 1)"
+        product="$(printf '%s\n' "$info" | sed -n 's/.*product[[:space:]]*\([0-9a-fA-F]*\).*/\1/p' | head -n 1)"
+        [ -n "$bus" ] || continue
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$path" "$bus" "$vendor" "$product" "$name" "$classes"
+    done
+}
+
+list_apps() {
+    cmd package query-activities --components -a android.intent.action.MAIN \
+        -c android.intent.category.LAUNCHER 2>/dev/null | awk '
+            /^[[:alnum:]_.]+\/[[:alnum:]_.$]+$/ && !seen[$0]++ { print }
+        '
+}
+
+capture_keys() {
+    seconds="${1:-5}"
+    mode="${2:-single}"
+    case "$seconds" in
+        ''|*[!0-9]*) echo "capture seconds must be an integer" >&2; return 2 ;;
+    esac
+    [ "$seconds" -ge 1 ] && [ "$seconds" -le 30 ] || {
+        echo "capture seconds must be between 1 and 30" >&2
+        return 2
+    }
+    case "$mode" in
+        single|combo) ;;
+        *) echo "capture mode must be single or combo" >&2; return 2 ;;
+    esac
+
+    request="$MODDIR/capture.request"
+    cleanup() { rm -f "$request"; }
+    trap cleanup EXIT INT TERM
+    : > "$request"
+    pkill -TERM -x fn-remap 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pidof -s fn-remap >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    if [ "$mode" = "combo" ]; then
+        "$MODDIR/bin/fn-remap" --capture "$seconds" --all
+    else
+        "$MODDIR/bin/fn-remap" --capture "$seconds"
+    fi
+}
+
+case "${1:-}" in
+    ensure)
+        write_defaults
+        ;;
+    list)
+        list_devices
+        ;;
+    apps)
+        list_apps
+        ;;
+    capture)
+        capture_keys "${2:-5}" "${3:-single}"
+        ;;
+    restart)
+        pkill -x fn-remap 2>/dev/null || true
+        ;;
+    status)
+        if [ -f "$PAUSE_REQUEST" ]; then
+            echo "paused"
+        elif pidof -s fn-remap >/dev/null 2>&1; then
+            echo "running"
+        else
+            echo "stopped"
+        fi
+        ;;
+    *)
+        echo "usage: keyboardctl {ensure|list|apps|capture [seconds] [single|combo]|restart|status}" >&2
+        exit 2
+        ;;
+esac
