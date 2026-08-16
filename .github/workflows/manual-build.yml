@@ -37,6 +37,7 @@ jobs:
     env:
       ANDROID_API: "26"
       ANDROID_PLATFORM: "35"
+      ANDROID_BUILD_TOOLS: "35.0.0"
       NDK_VERSION: 27.2.12479018
     steps:
       - name: Check out source
@@ -51,7 +52,7 @@ jobs:
       - name: Set up Android SDK and NDK
         uses: android-actions/setup-android@v4
         with:
-          packages: platforms;android-35 ndk;27.2.12479018
+          packages: platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018
 
       - name: Build module
         id: package
@@ -84,9 +85,11 @@ jobs:
           toolchain="$ndk_root/toolchains/llvm/prebuilt/linux-x86_64/bin"
           compiler="$toolchain/${target_triple}${ANDROID_API}-clang"
           android_jar="$ANDROID_HOME/platforms/android-$ANDROID_PLATFORM/android.jar"
+          d8="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/d8"
 
           test -x "$compiler"
           test -f "$android_jar"
+          test -x "$d8"
 
           rm -rf build
           mkdir -p build/java-classes build/module/bin
@@ -97,8 +100,10 @@ jobs:
 
           javac -source 8 -target 8 -cp "$android_jar" -d build/java-classes \
             ColorOsWindowLauncher.java
-          jar --create --file build/module/bin/coloros-window-launcher.jar \
-            -C build/java-classes .
+          "$d8" --min-api "$ANDROID_API" --lib "$android_jar" \
+            --output build/module/bin/coloros-window-launcher.jar \
+            build/java-classes/gold/keyboardremaps/ColorOsWindowLauncher.class
+          unzip -l build/module/bin/coloros-window-launcher.jar | grep -F 'classes.dex'
 
           install -m 0644 module.prop config.conf build/module/
           install -m 0755 service.sh action.sh build/module/
