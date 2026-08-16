@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -31,6 +32,8 @@
 #define MAX_COMBO_KEYS 8
 #define MAX_FN_TRANSFORMS 8
 #define EVENT_SCAN_LIMIT 64
+#define OUTPUT_BATCH_EVENTS 16
+#define RULE_INDEX_WORDS ((MAX_RULES + 63) / 64)
 
 typedef struct {
     const char *name;
@@ -68,6 +71,12 @@ typedef struct {
     size_t fn_transform_count;
     MappingRule rules[MAX_RULES];
     size_t rule_count;
+    bool mapping_sources[KEY_MAX + 1];
+    bool key_action_sources[KEY_MAX + 1];
+    bool app_modifier_sources[KEY_MAX + 1];
+    bool app_trigger_sources[KEY_MAX + 1];
+    uint64_t trigger_rules[KEY_MAX + 1][RULE_INDEX_WORDS];
+    uint64_t source_rules[KEY_MAX + 1][RULE_INDEX_WORDS];
 } Config;
 
 typedef struct {
@@ -81,9 +90,14 @@ typedef struct {
     bool forwarded[KEY_MAX + 1];
     bool active_rules[MAX_RULES];
     unsigned int target_refs[KEY_MAX + 1];
+    struct input_event output_batch[OUTPUT_BATCH_EVENTS];
+    size_t output_batch_count;
+    bool batching_output;
 } DeviceContext;
 
 static volatile sig_atomic_t keep_running = 1;
+
+static void index_config_keys(Config *config);
 
 static const KeyName k_key_names[] = {
     {"KEY_ESC", KEY_ESC}, {"KEY_1", KEY_1}, {"KEY_2", KEY_2},
@@ -371,6 +385,7 @@ static void load_config(Config *config) {
     FILE *file = fopen(CONFIG_PATH, "r");
     if (file == NULL) {
         add_default_mappings(config);
+        index_config_keys(config);
         return;
     }
 
@@ -399,6 +414,7 @@ static void load_config(Config *config) {
     if (config->selector_count == 0 && !config->auto_select) {
         config->auto_select = true;
     }
+    index_config_keys(config);
 }
 
 static bool is_virtual_name(const char *name) {
@@ -504,9 +520,9 @@ static bool source_already_open(const DeviceContext devices[MAX_DEVICES], size_t
     return false;
 }
 
-static int write_event(int fd, const struct input_event *event) {
-    const uint8_t *data = (const uint8_t *)event;
-    size_t remaining = sizeof(*event);
+static int write_events(int fd, const struct input_event *events, size_t count) {
+    const uint8_t *data = (const uint8_t *)events;
+    size_t remaining = count * sizeof(*events);
     while (remaining != 0) {
         ssize_t written = write(fd, data, remaining);
         if (written > 0) {
@@ -518,6 +534,32 @@ static int write_event(int fd, const struct input_event *event) {
             return -1;
         }
     }
+    return 0;
+}
+
+static int write_event(int fd, const struct input_event *event) {
+    return write_events(fd, event, 1);
+}
+
+static int flush_forwarded_events(DeviceContext *device) {
+    if (device->output_batch_count == 0) {
+        return 0;
+    }
+    int result = write_events(device->virtual_fd, device->output_batch,
+                              device->output_batch_count);
+    device->output_batch_count = 0;
+    return result;
+}
+
+static int forward_event(DeviceContext *device, const struct input_event *event) {
+    if (!device->batching_output) {
+        return write_event(device->virtual_fd, event);
+    }
+    if (device->output_batch_count == OUTPUT_BATCH_EVENTS &&
+        flush_forwarded_events(device) < 0) {
+        return -1;
+    }
+    device->output_batch[device->output_batch_count++] = *event;
     return 0;
 }
 
@@ -586,24 +628,6 @@ static int create_virtual_keyboard(int source_fd, const Config *config, const ch
     return fd;
 }
 
-static bool rule_contains(const MappingRule *rule, int key) {
-    for (size_t index = 0; index < rule->source_count; index++) {
-        if (rule->source[index] == key) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool key_is_mapping_source(const Config *config, int key) {
-    for (size_t index = 0; index < config->rule_count; index++) {
-        if (rule_contains(&config->rules[index], key)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool is_modifier_key(int key) {
     switch (key) {
         case KEY_LEFTCTRL:
@@ -621,17 +645,45 @@ static bool is_modifier_key(int key) {
     }
 }
 
-static bool is_app_modifier_source(const Config *config, int key) {
-    if (!is_modifier_key(key)) {
-        return false;
-    }
-    for (size_t index = 0; index < config->rule_count; index++) {
-        const MappingRule *rule = &config->rules[index];
-        if (rule->action == RULE_ACTION_LAUNCH_APP && rule_contains(rule, key)) {
-            return true;
+static void index_config_keys(Config *config) {
+    for (size_t rule_index = 0; rule_index < config->rule_count; rule_index++) {
+        const MappingRule *rule = &config->rules[rule_index];
+        for (size_t key_index = 0; key_index < rule->source_count; key_index++) {
+            int key = rule->source[key_index];
+            if (key < 0 || key > KEY_MAX) {
+                continue;
+            }
+            config->mapping_sources[key] = true;
+            config->source_rules[key][rule_index / 64] |= UINT64_C(1) << (rule_index % 64);
+            if (rule->action == RULE_ACTION_KEYS) {
+                config->key_action_sources[key] = true;
+                config->trigger_rules[key][rule_index / 64] |= UINT64_C(1) << (rule_index % 64);
+            } else if (rule->action == RULE_ACTION_LAUNCH_APP) {
+                if (is_modifier_key(key)) {
+                    config->app_modifier_sources[key] = true;
+                }
+                if (key_index + 1 == rule->source_count) {
+                    config->app_trigger_sources[key] = true;
+                    config->trigger_rules[key][rule_index / 64] |=
+                        UINT64_C(1) << (rule_index % 64);
+                }
+            }
         }
     }
-    return false;
+}
+
+static bool is_app_modifier_source(const Config *config, int key) {
+    return key >= 0 && key <= KEY_MAX && config->app_modifier_sources[key];
+}
+
+static bool is_app_trigger_source(const Config *config, int key) {
+    return key >= 0 && key <= KEY_MAX && config->app_trigger_sources[key];
+}
+
+static void improve_scheduling_latency(void) {
+    if (setpriority(PRIO_PROCESS, 0, -10) < 0) {
+        fprintf(stderr, "fn-remap: cannot raise process priority: %s\n", strerror(errno));
+    }
 }
 
 static int canonical_key(const Config *config, int key) {
@@ -655,15 +707,20 @@ static bool rule_is_complete(const MappingRule *rule, const DeviceContext *devic
 static int matching_rule(const Config *config, const DeviceContext *device, int trigger_key) {
     int selected = -1;
     size_t selected_size = 0;
-    for (size_t index = 0; index < config->rule_count; index++) {
-        const MappingRule *rule = &config->rules[index];
-        if (device->active_rules[index] || !rule_contains(rule, trigger_key) ||
-            !rule_is_complete(rule, device)) {
-            continue;
-        }
-        if (rule->source_count > selected_size) {
-            selected = (int)index;
-            selected_size = rule->source_count;
+    for (size_t word_index = 0; word_index < RULE_INDEX_WORDS; word_index++) {
+        uint64_t candidates = config->trigger_rules[trigger_key][word_index];
+        while (candidates != 0) {
+            unsigned int bit = (unsigned int)__builtin_ctzll(candidates);
+            size_t rule_index = word_index * 64 + bit;
+            candidates &= candidates - 1;
+            if (rule_index >= config->rule_count || device->active_rules[rule_index]) {
+                continue;
+            }
+            const MappingRule *rule = &config->rules[rule_index];
+            if (rule_is_complete(rule, device) && rule->source_count > selected_size) {
+                selected = (int)rule_index;
+                selected_size = rule->source_count;
+            }
         }
     }
     return selected;
@@ -674,7 +731,7 @@ static int emit_key(DeviceContext *device, const struct input_event *original, i
     output.type = EV_KEY;
     output.code = (uint16_t)key;
     output.value = value;
-    return write_event(device->virtual_fd, &output);
+    return forward_event(device, &output);
 }
 
 static int press_rule_target(DeviceContext *device, const MappingRule *rule,
@@ -799,47 +856,68 @@ static int handle_key_event(DeviceContext *device, const Config *config,
                             const struct input_event *event) {
     int raw_key = event->code;
     if (raw_key < 0 || raw_key > KEY_MAX) {
-        return write_event(device->virtual_fd, event);
+        return forward_event(device, event);
     }
     int key = canonical_key(config, raw_key);
     bool transformed_key = key != raw_key;
-    bool mapping_source = key_is_mapping_source(config, key);
+    bool mapping_source = config->mapping_sources[key];
 
     if (event->value == 1) {
         device->pressed[key] = true;
+        if (!mapping_source) {
+            return forward_event(device, event);
+        }
         int rule = matching_rule(config, device, key);
         if (rule >= 0) {
             return activate_rule(device, config, (size_t)rule, event);
         }
-        if (mapping_source) {
-            if (is_app_modifier_source(config, key)) {
-                device->forwarded[key] = true;
-                return write_event(device->virtual_fd, event);
-            }
-            device->pending[key] = true;
-            return 0;
+        if (!config->key_action_sources[key] && is_app_modifier_source(config, key)) {
+            device->forwarded[key] = true;
+            return forward_event(device, event);
         }
-        return write_event(device->virtual_fd, event);
+        if (!config->key_action_sources[key] && is_app_trigger_source(config, key)) {
+            device->forwarded[key] = true;
+            return forward_event(device, event);
+        }
+        device->pending[key] = true;
+        return 0;
     }
 
     if (event->value == 2) {
-        for (size_t index = 0; index < config->rule_count; index++) {
-            if (device->active_rules[index] && rule_contains(&config->rules[index], key) &&
-                config->rules[index].action == RULE_ACTION_KEYS &&
-                repeat_rule_target(device, &config->rules[index], event) < 0) {
-                return -1;
+        if (!mapping_source && !transformed_key) {
+            return forward_event(device, event);
+        }
+        for (size_t word_index = 0; word_index < RULE_INDEX_WORDS; word_index++) {
+            uint64_t candidates = config->source_rules[key][word_index];
+            while (candidates != 0) {
+                unsigned int bit = (unsigned int)__builtin_ctzll(candidates);
+                size_t rule_index = word_index * 64 + bit;
+                candidates &= candidates - 1;
+                if (rule_index < config->rule_count && device->active_rules[rule_index] &&
+                    config->rules[rule_index].action == RULE_ACTION_KEYS &&
+                    repeat_rule_target(device, &config->rules[rule_index], event) < 0) {
+                    return -1;
+                }
             }
         }
-        return mapping_source || transformed_key ? 0 : write_event(device->virtual_fd, event);
+        return mapping_source || transformed_key ? 0 : forward_event(device, event);
     }
 
     if (event->value == 0) {
-        for (size_t index = 0; index < config->rule_count; index++) {
-            if (device->active_rules[index] && rule_contains(&config->rules[index], key)) {
-                device->active_rules[index] = false;
-                if (config->rules[index].action == RULE_ACTION_KEYS &&
-                    release_rule_target(device, &config->rules[index], event) < 0) {
-                    return -1;
+        if (mapping_source) {
+            for (size_t word_index = 0; word_index < RULE_INDEX_WORDS; word_index++) {
+                uint64_t candidates = config->source_rules[key][word_index];
+                while (candidates != 0) {
+                    unsigned int bit = (unsigned int)__builtin_ctzll(candidates);
+                    size_t rule_index = word_index * 64 + bit;
+                    candidates &= candidates - 1;
+                    if (rule_index < config->rule_count && device->active_rules[rule_index]) {
+                        device->active_rules[rule_index] = false;
+                        if (config->rules[rule_index].action == RULE_ACTION_KEYS &&
+                            release_rule_target(device, &config->rules[rule_index], event) < 0) {
+                            return -1;
+                        }
+                    }
                 }
             }
         }
@@ -860,10 +938,25 @@ static int handle_key_event(DeviceContext *device, const Config *config,
             }
         }
         device->forwarded[key] = false;
-        return transformed_key ? 0 : write_event(device->virtual_fd, event);
+        return transformed_key ? 0 : forward_event(device, event);
     }
 
-    return transformed_key ? 0 : write_event(device->virtual_fd, event);
+    return transformed_key ? 0 : forward_event(device, event);
+}
+
+static bool is_direct_passthrough_event(const struct input_event *event, const Config *config) {
+    if (event->type == EV_MSC && event->code == MSC_SCAN) {
+        return false;
+    }
+    if (event->type != EV_KEY || event->code > KEY_MAX) {
+        return true;
+    }
+    int key = canonical_key(config, event->code);
+    return key == event->code && !config->mapping_sources[key];
+}
+
+static bool is_syn_report(const struct input_event *event) {
+    return event->type == EV_SYN && event->code == SYN_REPORT;
 }
 
 static int handle_source(DeviceContext *device, const Config *config) {
@@ -872,18 +965,40 @@ static int handle_source(DeviceContext *device, const Config *config) {
     if (count <= 0) {
         return count < 0 && (errno == EAGAIN || errno == EINTR) ? 0 : -1;
     }
-    for (ssize_t index = 0; index < count / (ssize_t)sizeof(struct input_event); index++) {
+    size_t event_count = (size_t)count / sizeof(*events);
+    for (size_t index = 0; index < event_count;) {
+        if (is_direct_passthrough_event(&events[index], config)) {
+            size_t first = index++;
+            while (index < event_count && is_direct_passthrough_event(&events[index], config)) {
+                index++;
+            }
+            if (write_events(device->virtual_fd, &events[first], index - first) < 0) {
+                return -1;
+            }
+            continue;
+        }
         const struct input_event *event = &events[index];
+        index++;
         if (event->type == EV_MSC && event->code == MSC_SCAN) {
             continue;
         }
+        bool batch_with_syn = event->type == EV_KEY && index < event_count &&
+                              is_syn_report(&events[index]);
+        device->batching_output = batch_with_syn;
         int result = event->type == EV_KEY ? handle_key_event(device, config, event)
-                                            : write_event(device->virtual_fd, event);
+                                            : forward_event(device, event);
+        if (result == 0 && batch_with_syn) {
+            result = forward_event(device, &events[index++]);
+        }
+        if (batch_with_syn && flush_forwarded_events(device) < 0) {
+            result = -1;
+        }
+        device->batching_output = false;
         if (result < 0) {
             return -1;
         }
     }
-    return 0;
+    return flush_forwarded_events(device);
 }
 
 static int handle_virtual_output(DeviceContext *device) {
@@ -1114,10 +1229,16 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, con
                 virtual->revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 return -1;
             }
-            if ((virtual->revents & POLLIN) && handle_virtual_output(&devices[index]) < 0) {
+        }
+        for (size_t index = 0; index < count; index++) {
+            struct pollfd *source = &fds[index * 2];
+            if ((source->revents & POLLIN) && handle_source(&devices[index], config) < 0) {
                 return -1;
             }
-            if ((source->revents & POLLIN) && handle_source(&devices[index], config) < 0) {
+        }
+        for (size_t index = 0; index < count; index++) {
+            struct pollfd *virtual = &fds[index * 2 + 1];
+            if ((virtual->revents & POLLIN) && handle_virtual_output(&devices[index]) < 0) {
                 return -1;
             }
         }
@@ -1130,6 +1251,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, stop);
     signal(SIGHUP, stop);
     signal(SIGCHLD, SIG_IGN);
+    improve_scheduling_latency();
 
     if (argc >= 2 && strcmp(argv[1], "--capture") == 0) {
         unsigned long seconds = 5;

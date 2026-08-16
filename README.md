@@ -146,6 +146,10 @@ launch=KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_Q=>com.example.app/.MainActivity|freeform|
 
 按键之间使用 `+`，输入和输出之间使用 `=>`。每个组合最多 8 个按键。捕获到内置表中没有的按键时，会显示为 `CODE_数字`，可以直接写入映射。
 
+应用启动规则按声明顺序触发：先按前置键，再按组合中的最后一个键。例如
+`KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_Z` 需要先按 Ctrl 和 Shift，最后按 Z。这样普通的
+`Shift+Z` 会立即透传，不会等待松键。
+
 手动修改后，可在 root shell 中重启转发器：
 
 ```sh
