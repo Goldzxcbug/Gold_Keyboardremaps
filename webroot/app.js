@@ -122,6 +122,11 @@ const state = {
   selected: new Set(),
   rules: [],
   editor: null,
+  mappingUi: {
+    expanded: false,
+    addOpen: false,
+    draft: null,
+  },
 };
 
 let captureTimer = null;
@@ -466,6 +471,77 @@ function renderMappings() {
       </div>
     </div>
   `).join("");
+  updateMappingPanel();
+}
+
+function updateMappingPanel() {
+  const panel = $("#mappingPanel");
+  const toggle = $("#toggleMappings");
+  const addPanel = $("#mappingAddPanel");
+  const rulesPanel = $("#mappingRulesPanel");
+  if (!panel || !toggle || !addPanel || !rulesPanel) return;
+  panel.classList.toggle("is-collapsed", !state.mappingUi.expanded && !state.mappingUi.addOpen);
+  toggle.textContent = state.mappingUi.expanded ? "收起" : "展开";
+  toggle.title = state.mappingUi.expanded ? "收起映射规则" : "展开映射规则";
+  toggle.setAttribute("aria-expanded", String(state.mappingUi.expanded));
+  addPanel.hidden = !state.mappingUi.addOpen;
+  rulesPanel.hidden = !state.mappingUi.expanded;
+  panel.classList.toggle("has-add-panel", state.mappingUi.addOpen);
+  document.querySelectorAll("[data-add-role]").forEach((option) => {
+    option.classList.remove("selected");
+    option.removeAttribute("aria-pressed");
+  });
+  const draft = state.mappingUi.draft;
+  if (!draft) return;
+  const sourceOption = document.querySelector(`[data-add-role="source"][data-add-mode="${draft.sourceMode || ""}"]`);
+  const targetOption = document.querySelector(`[data-add-role="target"][data-add-type="${draft.targetType || ""}"]`);
+  [sourceOption, targetOption].forEach((option) => {
+    if (!option) return;
+    option.classList.add("selected");
+    option.setAttribute("aria-pressed", "true");
+  });
+  const labels = {
+    "source-single": draft.sourceMode === "single" && draft.source?.length ? `已选：${draft.source.map(keyLabel).join("、")}` : "选择一个输入按键",
+    "source-combo": draft.sourceMode === "combo" && draft.source?.length ? `已选：${draft.source.map(keyLabel).join("、")}` : "选择多个输入按键",
+    "target-keys": draft.targetType === "keys" && draft.target?.length ? `已选：${draft.target.map(keyLabel).join("、")}` : "选择输出按键",
+    "target-app": draft.targetType === "app" && draft.component ? `已选：${readableAppName(draft.component)}` : "选择要打开的应用",
+  };
+  document.querySelectorAll("[data-add-selection]").forEach((element) => {
+    element.textContent = labels[element.dataset.addSelection] || element.textContent;
+  });
+  const ready = Boolean(draft.source?.length && draft.targetType && (draft.targetType === "keys" ? draft.target?.length : draft.component));
+  $("#draftStatus").textContent = ready ? "输入和功能已完成，可以保存规则" : "请先选择输入按键和功能";
+  $("#saveDraftRule").disabled = !ready;
+}
+
+function openAddMapping() {
+  state.mappingUi.expanded = false;
+  state.mappingUi.addOpen = true;
+  state.mappingUi.draft = { sourceMode: null, source: [], targetType: null, target: [], component: "", freeform: false, closeOnRepeat: false };
+  updateMappingPanel();
+  $("#mappingAddPanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function closeAddMapping() {
+  state.mappingUi.addOpen = false;
+  state.mappingUi.expanded = false;
+  state.mappingUi.draft = null;
+  updateMappingPanel();
+}
+
+function chooseMappingPart(option) {
+  const role = option.dataset.addRole;
+  const mode = option.dataset.addMode || "single";
+  const type = role === "target" ? option.dataset.addType : "keys";
+  const draft = state.mappingUi.draft || { sourceMode: null, source: [], targetType: null, target: [], component: "", freeform: false, closeOnRepeat: false };
+  state.mappingUi.draft = draft;
+  if (role === "source") {
+    draft.sourceMode = mode;
+    openEditor(mode, null, "keys", "source");
+  } else {
+    draft.targetType = type;
+    openEditor(draft.sourceMode || "single", null, type, "target");
+  }
 }
 
 function setSelectValues(element, values) {
@@ -505,15 +581,23 @@ function setupCollapsiblePanel(panel) {
 function configureEditorAction(type, rule = {}) {
   if (!state.editor) return;
   const appRule = type === "app";
+  const draftPart = state.editor.draftPart;
   state.editor.type = type;
-  $("#keyTargetField").hidden = appRule;
-  $("#appTargetField").hidden = !appRule;
-  $("#openAppAction").hidden = appRule || state.editor.mode !== "combo";
-  $("#useKeyAction").hidden = !appRule;
+  $("#sourceKeyField").hidden = draftPart === "target";
+  $("#keyTargetField").hidden = appRule || draftPart === "source";
+  $("#appTargetField").hidden = !appRule || draftPart === "source";
+  $("#openAppAction").hidden = appRule || draftPart === "source";
+  $("#useKeyAction").hidden = !appRule || draftPart === "source";
   const creating = state.editor.index === null;
-  $("#editorTitle").textContent = creating ? (appRule ? "新建应用映射" : "新建映射") : (appRule ? "编辑应用映射" : "编辑映射");
-  $("#editorMode").textContent = appRule ? "组合键 · 打开应用" : state.editor.mode === "combo" ? "组合键映射" : "单键映射";
-  $("#saveRule").textContent = creating ? (appRule ? "加入应用规则" : "加入规则") : (appRule ? "更新应用规则" : "更新规则");
+  $("#editorTitle").textContent = draftPart === "source"
+    ? (state.editor.mode === "combo" ? "选择组合输入" : "选择单键输入")
+    : draftPart === "target"
+      ? (appRule ? "选择打开应用" : "选择按键输出")
+      : creating ? (appRule ? "新建应用映射" : "新建映射") : (appRule ? "编辑应用映射" : "编辑映射");
+  $("#editorMode").textContent = appRule
+    ? `${state.editor.mode === "combo" ? "组合键" : "单键"} · 打开应用`
+    : state.editor.mode === "combo" ? "组合键映射" : "单键映射";
+  $("#saveRule").textContent = state.editor?.draftPart ? "完成选择" : creating ? (appRule ? "加入应用规则" : "加入规则") : (appRule ? "更新应用规则" : "更新规则");
   if (appRule) {
     $("#appSearch").value = "";
     $("#appFreeform").checked = Boolean(rule.freeform);
@@ -524,20 +608,25 @@ function configureEditorAction(type, rule = {}) {
 }
 
 function switchEditorAction(type) {
-  if (!state.editor || (type === "app" && state.editor.mode !== "combo")) return;
+  if (!state.editor) return;
   const appRule = type === "app"
     ? { component: $("#appTarget").value, freeform: $("#appFreeform").checked, closeOnRepeat: $("#appCloseOnRepeat").checked }
     : {};
   configureEditorAction(type, appRule);
 }
 
-function openEditor(mode, index = null, requestedType = "keys") {
+function openEditor(mode, index = null, requestedType = "keys", draftPart = "") {
   setCaptureStatus();
   const existingRule = index === null ? null : state.rules[index];
   const type = existingRule?.type || requestedType;
-  const editorMode = type === "app" ? "combo" : mode;
-  state.editor = { mode: editorMode, index, type };
-  const rule = existingRule || { source: [], target: [] };
+  const editorMode = mode;
+  state.editor = { mode: editorMode, index, type, draftPart };
+  const draft = state.mappingUi.draft;
+  const rule = existingRule || (draftPart === "source"
+    ? { source: draft?.source || [], target: [] }
+    : draftPart === "target" && type === "app"
+      ? { source: draft?.source || [], target: [], component: draft?.component || "", freeform: draft?.freeform, closeOnRepeat: draft?.closeOnRepeat }
+      : { source: draft?.source || [], target: draft?.target || [] });
   $("#sourceKeys").innerHTML = keyOptions();
   $("#targetKeys").innerHTML = keyOptions();
   ensureKeyOptions($("#sourceKeys"), rule.source);
@@ -548,12 +637,15 @@ function openEditor(mode, index = null, requestedType = "keys") {
   $("#captureSource").textContent = captureLabel;
   $("#captureTarget").textContent = captureLabel;
   configureEditorAction(type, rule);
+  $("#ruleArrow").hidden = Boolean(draftPart);
+  $("#editor").classList.toggle("draft-editor", Boolean(draftPart));
   setPanelCollapsed($("#editor"), false);
   $("#editor").hidden = false;
   $("#editor").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 function closeEditor() {
+  const draftPart = state.editor?.draftPart;
   if (captureTimer !== null) {
     clearInterval(captureTimer);
     captureTimer = null;
@@ -561,6 +653,15 @@ function closeEditor() {
   setCaptureStatus();
   state.editor = null;
   $("#editor").hidden = true;
+  $("#editor").classList.remove("draft-editor");
+  $("#ruleArrow").hidden = false;
+  $("#sourceKeyField").hidden = false;
+  if (draftPart) {
+    state.mappingUi.expanded = false;
+    state.mappingUi.addOpen = true;
+    updateMappingPanel();
+    $("#mappingAddPanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
 }
 
 function keyboardButton(definition, selected) {
@@ -711,8 +812,67 @@ async function captureKeys(selector) {
   }
 }
 
+function saveDraftPart() {
+  if (!state.editor?.draftPart || !state.mappingUi.draft) return;
+  const draft = state.mappingUi.draft;
+  if (state.editor.draftPart === "source") {
+    const source = selectedOptions("#sourceKeys");
+    if (source.length === 0) {
+      setNotice("请至少选择一个输入键。", true);
+      return;
+    }
+    if (state.editor.mode === "single" && source.length !== 1) {
+      setNotice("单键只能选择一个输入键。", true);
+      return;
+    }
+    draft.sourceMode = state.editor.mode;
+    draft.source = source;
+  } else if (state.editor.type === "app") {
+    const component = $("#appTarget").value;
+    if (!component) {
+      setNotice("请选择要打开的应用。", true);
+      return;
+    }
+    draft.targetType = "app";
+    draft.component = component;
+    draft.freeform = $("#appFreeform").checked;
+    draft.closeOnRepeat = $("#appCloseOnRepeat").checked;
+  } else {
+    const target = orderedOutputKeys(selectedOptions("#targetKeys"));
+    if (target.length === 0) {
+      setNotice("请至少选择一个输出键。", true);
+      return;
+    }
+    draft.targetType = "keys";
+    draft.target = target;
+  }
+  closeEditor();
+  setNotice("已完成当前选择，请继续选择另一侧。");
+}
+
+function saveDraftRule() {
+  const draft = state.mappingUi.draft;
+  if (!draft?.source?.length || !draft.targetType || (draft.targetType === "keys" ? !draft.target?.length : !draft.component)) {
+    setNotice("请先完成输入按键和功能选择。", true);
+    return;
+  }
+  const rule = draft.targetType === "app"
+    ? { type: "app", source: draft.source, component: draft.component, freeform: draft.freeform, closeOnRepeat: draft.closeOnRepeat }
+    : { type: "keys", source: draft.source, target: orderedOutputKeys(draft.target) };
+  state.rules.push(rule);
+  state.mappingUi.draft = null;
+  state.mappingUi.addOpen = false;
+  state.mappingUi.expanded = true;
+  renderMappings();
+  setNotice("规则已添加，保存并应用后生效。");
+}
+
 function saveRule() {
   if (!state.editor) return;
+  if (state.editor.draftPart) {
+    saveDraftPart();
+    return;
+  }
   const source = selectedOptions("#sourceKeys");
   if (source.length === 0) {
     setNotice("请至少选择一个输入键。", true);
@@ -740,6 +900,8 @@ function saveRule() {
   }
   if (state.editor.index === null) state.rules.push(rule);
   else state.rules[state.editor.index] = rule;
+  state.mappingUi.expanded = true;
+  state.mappingUi.addOpen = false;
   closeEditor();
   renderMappings();
   setNotice("规则已更新，保存并应用后生效。");
@@ -769,6 +931,10 @@ function base64(text) {
 }
 
 async function applyConfig(button, busyText, readyText, successMessage) {
+  if (state.mappingUi.draft || state.editor?.draftPart) {
+    setNotice("请先完成输入和功能选择，并点击“保存规则”。", true);
+    return;
+  }
   if (!state.auto && state.selected.size === 0) {
     setNotice("请至少选择一个输入节点，或启用自动兼容模式。", true);
     return;
@@ -862,10 +1028,9 @@ $("#refreshDevices").addEventListener("click", refreshDevices);
 $("#themeToggle").addEventListener("click", cycleTheme);
 $("#saveConfig").addEventListener("click", saveConfig);
 $("#restoreDefaults").addEventListener("click", restoreDefaults);
-$("#addSingle").addEventListener("click", () => openEditor("single"));
-$("#addCombo").addEventListener("click", () => openEditor("combo"));
 $("#cancelEdit").addEventListener("click", closeEditor);
 $("#saveRule").addEventListener("click", saveRule);
+$("#saveDraftRule").addEventListener("click", saveDraftRule);
 $("#captureSource").addEventListener("click", () => captureKeys("#sourceKeys"));
 $("#captureTarget").addEventListener("click", () => captureKeys("#targetKeys"));
 $("#openAppAction").addEventListener("click", () => switchEditorAction("app"));
@@ -919,10 +1084,22 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !$("#keyboardDialog").hidden) closeKeyboardView();
 });
 
-document.querySelectorAll(".panel").forEach(setupCollapsiblePanel);
+document.querySelectorAll(".panel:not(#mappingPanel)").forEach(setupCollapsiblePanel);
+$("#toggleMappings").addEventListener("click", () => {
+  state.mappingUi.addOpen = false;
+  state.mappingUi.expanded = !state.mappingUi.expanded;
+  updateMappingPanel();
+});
+$("#addMapping").addEventListener("click", openAddMapping);
+$("#closeAddMapping").addEventListener("click", closeAddMapping);
+$("#mappingAddPanel").addEventListener("click", (event) => {
+  const option = event.target.closest("[data-add-role]");
+  if (option) chooseMappingPart(option);
+});
 initialize();
 applyTheme(storedTheme());
 const colorScheme = window.matchMedia?.("(prefers-color-scheme: dark)");
 colorScheme?.addEventListener?.("change", () => {
   if (storedTheme() === "auto") applyTheme("auto");
 });
+updateMappingPanel();

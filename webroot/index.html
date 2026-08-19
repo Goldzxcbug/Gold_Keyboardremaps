@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#f4f6f8">
   <title>Gold Keyboard Remaps</title>
-  <link rel="stylesheet" href="style.css?v=20260815-app-mapping-3">
+  <link rel="stylesheet" href="style.css?v=20260819-mapping-draft-1">
 </head>
 <body>
   <header class="topbar">
@@ -41,20 +41,65 @@
       <div id="deviceList" class="device-list" aria-live="polite"></div>
     </section>
 
-    <section class="panel" aria-labelledby="mappingTitle">
+    <section id="mappingPanel" class="panel mapping-panel" aria-labelledby="mappingTitle">
       <div class="section-head mapping-head">
         <div>
           <p class="section-kicker">事件转换</p>
           <h2 id="mappingTitle">按键映射</h2>
         </div>
-        <div class="button-row">
-          <button id="addSingle" class="button secondary" type="button">添加单键</button>
-          <button id="addCombo" class="button secondary" type="button">添加组合</button>
+        <div class="section-actions">
+          <button id="addMapping" class="button primary" type="button">添加</button>
+          <button id="toggleMappings" class="button ghost panel-toggle" type="button" aria-expanded="false">展开</button>
         </div>
       </div>
-      <p id="fnHint" class="mapping-hint" role="status"></p>
-      <div id="mappingList" class="mapping-list"></div>
-      <div id="emptyMappings" class="empty-state" hidden>暂无映射规则</div>
+      <div id="mappingContent" class="mapping-content">
+        <div id="mappingRulesPanel" class="mapping-rules-panel">
+          <p id="fnHint" class="mapping-hint" role="status"></p>
+          <div id="mappingList" class="mapping-list"></div>
+          <div id="emptyMappings" class="empty-state" hidden>暂无映射规则</div>
+        </div>
+        <div id="mappingAddPanel" class="mapping-add-panel" hidden>
+          <div class="add-panel-head">
+            <div>
+              <p class="section-kicker">新建规则</p>
+              <h3>选择输入和功能</h3>
+            </div>
+            <button id="closeAddMapping" class="button ghost" type="button">关闭</button>
+          </div>
+          <div class="mapping-add-layout">
+            <div class="add-column">
+              <div class="add-column-title"><span class="add-step">A</span><span>输入按键</span></div>
+              <button class="add-option" type="button" data-add-role="source" data-add-mode="single">
+                <span class="add-option-icon">●</span>
+                <span><strong>添加单键</strong><small data-add-selection="source-single">选择一个输入按键</small></span>
+                <span class="add-option-arrow" aria-hidden="true">›</span>
+              </button>
+              <button class="add-option" type="button" data-add-role="source" data-add-mode="combo">
+                <span class="add-option-icon">＋</span>
+                <span><strong>添加组合</strong><small data-add-selection="source-combo">选择多个输入按键</small></span>
+                <span class="add-option-arrow" aria-hidden="true">›</span>
+              </button>
+            </div>
+            <div class="add-column">
+              <div class="add-column-title"><span class="add-step">B</span><span>功能</span></div>
+              <button class="add-option" type="button" data-add-role="target" data-add-mode="single" data-add-type="keys">
+                <span class="add-option-icon">⌨</span>
+                <span><strong>按键输出</strong><small data-add-selection="target-keys">选择输出按键</small></span>
+                <span class="add-option-arrow" aria-hidden="true">›</span>
+              </button>
+              <button class="add-option" type="button" data-add-role="target" data-add-mode="single" data-add-type="app">
+                <span class="add-option-icon">▣</span>
+                <span><strong>打开应用</strong><small data-add-selection="target-app">选择要打开的应用</small></span>
+                <span class="add-option-arrow" aria-hidden="true">›</span>
+              </button>
+            </div>
+          </div>
+          <div class="draft-summary" aria-live="polite">
+            <span id="draftStatus" class="muted">请先选择输入按键和功能</span>
+            <button id="saveDraftRule" class="button primary" type="button" disabled>保存规则</button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section id="editor" class="panel editor" hidden aria-labelledby="editorTitle">
@@ -66,13 +111,13 @@
         <button id="cancelEdit" class="button ghost" type="button">取消</button>
       </div>
       <div class="editor-grid">
-        <label class="field">
+        <label id="sourceKeyField" class="field">
           <span class="field-heading"><span>输入键</span><button id="captureSource" class="button ghost capture-button" type="button">捕获按键 5 秒</button></span>
           <div id="captureStatus" class="capture-status" role="status" aria-live="polite">捕获状态：等待开始。点击上方按钮后，在 5 秒内按下外接键盘按键。</div>
           <select id="sourceKeys" multiple size="7"></select>
           <small>单键模式识别到首个按键即结束；组合模式会完整监听 5 秒，可连续捕获多个按键。捕获只监听已选外接键盘。</small>
         </label>
-        <div class="rule-arrow" aria-hidden="true">→</div>
+        <div id="ruleArrow" class="rule-arrow" aria-hidden="true">→</div>
         <label id="keyTargetField" class="field">
           <span class="field-heading"><span>输出键</span><span class="capture-actions"><button id="openAppAction" class="button ghost capture-button" type="button">打开应用</button><button id="keyboardView" class="button ghost capture-button" type="button">键盘视图</button><button id="captureTarget" class="button ghost capture-button" type="button">捕获按键 5 秒</button></span></span>
           <select id="targetKeys" multiple size="7"></select>
@@ -119,6 +164,6 @@
       </div>
     </footer>
   </main>
-  <script type="module" src="app.js?v=20260815-normal-toggle-1"></script>
+  <script type="module" src="app.js?v=20260819-mapping-draft-1"></script>
 </body>
 </html>
