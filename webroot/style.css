@@ -168,6 +168,7 @@ main { width: min(980px, 100%); margin: 0 auto; padding: 20px; }
 .mapping-keys { display: flex; flex: 1; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
 .key-chip { display: inline-flex; align-items: center; min-height: 26px; padding: 0 8px; border-radius: 4px; color: var(--accent-dark); background: var(--accent-soft); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700; }
 .app-chip { display: inline-flex; align-items: center; min-height: 26px; max-width: min(100%, 360px); padding: 0 8px; overflow: hidden; color: var(--ok); border: 1px solid var(--ok-border); border-radius: 4px; background: var(--ok-soft); font-size: 12px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
+.shell-chip { display: inline-flex; align-items: center; min-height: 26px; max-width: min(100%, 560px); padding: 0 8px; overflow: hidden; color: var(--accent-dark); border: 1px solid var(--line-strong); border-radius: 4px; background: var(--surface-alt); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .app-window-chip { color: var(--muted); font-size: 11px; font-weight: 700; }
 .mapping-arrow { color: var(--muted); font-size: 20px; }
 .empty-state { padding: 28px 12px; color: var(--muted); text-align: center; border: 1px dashed var(--line); border-radius: 6px; }
@@ -203,7 +204,10 @@ main { width: min(980px, 100%); margin: 0 auto; padding: 20px; }
 .capture-button { min-height: 30px; padding: 0 9px; font-size: 12px; }
 .field select { width: 100%; min-height: 166px; padding: 5px; color: var(--text); border: 1px solid var(--line); border-radius: 6px; background: var(--surface-input); }
 .field input { width: 100%; min-height: 36px; padding: 0 10px; color: var(--text); border: 1px solid var(--line); border-radius: 6px; background: var(--surface-input); }
-.field select:focus, .field input:focus { outline: 2px solid var(--focus); outline-offset: 1px; }
+.field textarea { width: 100%; min-height: 132px; padding: 9px 10px; resize: vertical; color: var(--text); border: 1px solid var(--line); border-radius: 6px; background: var(--surface-input); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.field select:focus, .field input:focus, .field textarea:focus { outline: 2px solid var(--focus); outline-offset: 1px; }
+.shell-test-output { display: block; max-height: 150px; overflow: auto; padding: 8px 10px; color: var(--text); border: 1px solid var(--line); border-radius: 5px; background: var(--surface-alt); font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+.shell-test-output.error { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
 .field option { padding: 6px 7px; }
 .field small { color: var(--muted); font-size: 11px; font-weight: 500; }
 .check-line { display: inline-flex; align-items: center; gap: 8px; color: var(--text); font-size: 12px; font-weight: 650; }

@@ -98,7 +98,11 @@ Gold_Keyboardremaps/
 
 默认配置包含 `Ctrl + Shift + Z` 启动 QQ 的示例规则。如果设备没有 QQ，请在 WebUI 中删除或修改该规则。
 
-### 5. 暂停和恢复
+### 5. 执行 Shell 命令
+
+点击“添加”后选择“自定义 Shell 命令”，输入要执行的命令即可。默认使用 Android shell 用户执行；勾选“使用 root 权限执行”后会通过 KernelSU root 执行。命令支持多行，WebUI 会使用 Base64 写入配置并提供“测试命令”按钮。Shell 动作和按键输出、应用启动一样，必须先完成输入按键和功能两侧才能保存。
+
+### 6. 暂停和恢复
 
 在 KernelSU 模块详情中点击模块操作按钮即可切换状态。暂停后输入转发器会停止，恢复后会自动重新启动。修改映射前如果担心按键失控，可以先暂停模块。
 
@@ -142,6 +146,10 @@ mapping=KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_Z=>KEY_C
 # 启动应用，mode 为 normal 或 freeform，可选 toggle
 launch=KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_Z=>com.example.app/.MainActivity|normal
 launch=KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_Q=>com.example.app/.MainActivity|freeform|toggle
+
+# 自定义 Shell 命令（WebUI 会自动使用 Base64 保存命令内容）
+shell=KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_H=>shell|b64:aW5wdXQga2V5ZXZlbnQgSE9NRQ==
+shell=KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_R=>root|b64:cmVib290
 ```
 
 按键之间使用 `+`，输入和输出之间使用 `=>`。每个组合最多 8 个按键。捕获到内置表中没有的按键时，会显示为 `CODE_数字`，可以直接写入映射。
@@ -149,6 +157,9 @@ launch=KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_Q=>com.example.app/.MainActivity|freeform|
 应用启动规则按声明顺序触发：先按前置键，再按组合中的最后一个键。例如
 `KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_Z` 需要先按 Ctrl 和 Shift，最后按 Z。这样普通的
 `Shift+Z` 会立即透传，不会等待松键。
+
+Shell 规则同样在组合中的最后一个键按下时执行。`shell` 模式通过 Android shell 用户执行，
+`root` 模式通过 KernelSU root 执行；两种模式都不会把命令输出转发到按键设备。
 
 手动修改后，可在 root shell 中重启转发器：
 

@@ -290,6 +290,24 @@ function parseConfig(text) {
       const [component, mode = "normal", repeatMode = ""] = destination.split("|");
       if (!component || (mode !== "normal" && mode !== "freeform") || (repeatMode && repeatMode !== "toggle")) continue;
       state.rules.push({ type: "app", source: source.split("+").filter(Boolean), component, freeform: mode === "freeform", closeOnRepeat: repeatMode === "toggle" });
+      continue;
+    }
+    if (line.startsWith("shell=")) {
+      const [source, destination] = line.slice(6).split("=>");
+      if (!source || !destination) continue;
+      const separator = destination.indexOf("|");
+      if (separator < 0) continue;
+      const mode = destination.slice(0, separator).trim();
+      let command = destination.slice(separator + 1);
+      if (command.startsWith("b64:")) {
+        try {
+          command = decodeBase64(command.slice(4));
+        } catch (_) {
+          continue;
+        }
+      }
+      if (!command.trim() || (mode !== "shell" && mode !== "root")) continue;
+      state.rules.push({ type: "shell", source: source.split("+").filter(Boolean), shellCommand: command, shellRunAsRoot: mode === "root" });
     }
   }
 }
@@ -451,14 +469,19 @@ function ruleTarget(rule) {
   if (rule.type === "app") {
     return `<span class="app-chip" title="${html(rule.component)}">打开 ${html(appRuleLabel(rule))}</span>${rule.freeform ? '<span class="app-window-chip">小窗</span>' : ""}${rule.closeOnRepeat ? '<span class="app-window-chip">重复关闭</span>' : ""}`;
   }
+  if (rule.type === "shell") {
+    const command = String(rule.shellCommand || "").replace(/\s+/g, " ").trim();
+    const label = command.length > 72 ? `${command.slice(0, 69)}...` : command;
+    return `<span class="shell-chip" title="${html(rule.shellCommand || "")}">执行 ${html(label)}</span><span class="app-window-chip">${rule.shellRunAsRoot ? "root" : "shell"}</span>`;
+  }
   return chips(rule.target || []);
 }
 
 function renderMappings() {
   const list = $("#mappingList");
   $("#emptyMappings").hidden = state.rules.length !== 0;
-  const fnTransform = state.rules.some((rule) => rule.type !== "app" && rule.source.length === 1 && rule.source[0] === "KEY_F23" && rule.target.length === 1 && rule.target[0] === "KEY_FN");
-  const fnRules = state.rules.some((rule) => rule.type !== "app" && rule.source.includes("KEY_FN"));
+  const fnTransform = state.rules.some((rule) => rule.type === "keys" && rule.source.length === 1 && rule.source[0] === "KEY_F23" && rule.target.length === 1 && rule.target[0] === "KEY_FN");
+  const fnRules = state.rules.some((rule) => rule.type === "keys" && rule.source.includes("KEY_FN"));
   $("#fnHint").textContent = fnTransform && fnRules
     ? "当前 Fn 预映射：F23（厂商功能键）→ Fn，随后由 Fn 组合规则转换为 F1-F12。"
     : "未检测到 Fn 来源键；添加映射时可点击“捕获按键 5 秒”，然后按下键盘上的 Fn 或目标按键。";
@@ -505,11 +528,15 @@ function updateMappingPanel() {
     "source-combo": draft.sourceMode === "combo" && draft.source?.length ? `已选：${draft.source.map(keyLabel).join("、")}` : "选择多个输入按键",
     "target-keys": draft.targetType === "keys" && draft.target?.length ? `已选：${draft.target.map(keyLabel).join("、")}` : "选择输出按键",
     "target-app": draft.targetType === "app" && draft.component ? `已选：${readableAppName(draft.component)}` : "选择要打开的应用",
+    "target-shell": draft.targetType === "shell" && draft.shellCommand ? `已选：${draft.shellCommand.replace(/\s+/g, " ").trim().slice(0, 42)}` : "编辑要执行的命令",
   };
   document.querySelectorAll("[data-add-selection]").forEach((element) => {
     element.textContent = labels[element.dataset.addSelection] || element.textContent;
   });
-  const ready = Boolean(draft.source?.length && draft.targetType && (draft.targetType === "keys" ? draft.target?.length : draft.component));
+  const ready = Boolean(draft.source?.length && draft.targetType && (
+    draft.targetType === "keys" ? draft.target?.length :
+      draft.targetType === "app" ? draft.component : draft.shellCommand?.trim()
+  ));
   $("#draftStatus").textContent = ready ? "输入和功能已完成，可以保存规则" : "请先选择输入按键和功能";
   $("#saveDraftRule").disabled = !ready;
 }
@@ -517,7 +544,7 @@ function updateMappingPanel() {
 function openAddMapping() {
   state.mappingUi.expanded = false;
   state.mappingUi.addOpen = true;
-  state.mappingUi.draft = { sourceMode: null, source: [], targetType: null, target: [], component: "", freeform: false, closeOnRepeat: false };
+  state.mappingUi.draft = { sourceMode: null, source: [], targetType: null, target: [], component: "", freeform: false, closeOnRepeat: false, shellCommand: "", shellRunAsRoot: false };
   updateMappingPanel();
   $("#mappingAddPanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
@@ -533,7 +560,7 @@ function chooseMappingPart(option) {
   const role = option.dataset.addRole;
   const mode = option.dataset.addMode || "single";
   const type = role === "target" ? option.dataset.addType : "keys";
-  const draft = state.mappingUi.draft || { sourceMode: null, source: [], targetType: null, target: [], component: "", freeform: false, closeOnRepeat: false };
+  const draft = state.mappingUi.draft || { sourceMode: null, source: [], targetType: null, target: [], component: "", freeform: false, closeOnRepeat: false, shellCommand: "", shellRunAsRoot: false };
   state.mappingUi.draft = draft;
   if (role === "source") {
     draft.sourceMode = mode;
@@ -581,23 +608,36 @@ function setupCollapsiblePanel(panel) {
 function configureEditorAction(type, rule = {}) {
   if (!state.editor) return;
   const appRule = type === "app";
+  const shellRule = type === "shell";
   const draftPart = state.editor.draftPart;
   state.editor.type = type;
   $("#sourceKeyField").hidden = draftPart === "target";
-  $("#keyTargetField").hidden = appRule || draftPart === "source";
+  $("#keyTargetField").hidden = appRule || shellRule || draftPart === "source";
   $("#appTargetField").hidden = !appRule || draftPart === "source";
+  $("#shellTargetField").hidden = !shellRule || draftPart === "source";
   $("#openAppAction").hidden = appRule || draftPart === "source";
   $("#useKeyAction").hidden = !appRule || draftPart === "source";
   const creating = state.editor.index === null;
   $("#editorTitle").textContent = draftPart === "source"
     ? (state.editor.mode === "combo" ? "选择组合输入" : "选择单键输入")
     : draftPart === "target"
-      ? (appRule ? "选择打开应用" : "选择按键输出")
-      : creating ? (appRule ? "新建应用映射" : "新建映射") : (appRule ? "编辑应用映射" : "编辑映射");
+      ? (appRule ? "选择打开应用" : shellRule ? "编辑 Shell 命令" : "选择按键输出")
+      : creating ? (appRule ? "新建应用映射" : shellRule ? "新建 Shell 规则" : "新建映射") : (appRule ? "编辑应用映射" : shellRule ? "编辑 Shell 规则" : "编辑映射");
   $("#editorMode").textContent = appRule
     ? `${state.editor.mode === "combo" ? "组合键" : "单键"} · 打开应用`
-    : state.editor.mode === "combo" ? "组合键映射" : "单键映射";
-  $("#saveRule").textContent = state.editor?.draftPart ? "完成选择" : creating ? (appRule ? "加入应用规则" : "加入规则") : (appRule ? "更新应用规则" : "更新规则");
+    : shellRule
+      ? `${state.editor.mode === "combo" ? "组合键" : "单键"} · Shell 命令`
+      : state.editor.mode === "combo" ? "组合键映射" : "单键映射";
+  $("#saveRule").textContent = state.editor?.draftPart
+    ? "完成选择"
+    : creating
+      ? (appRule ? "加入应用规则" : shellRule ? "加入 Shell 规则" : "加入规则")
+      : (appRule ? "更新应用规则" : shellRule ? "更新 Shell 规则" : "更新规则");
+  if (shellRule) {
+    $("#shellCommand").value = rule.shellCommand || "";
+    $("#shellRunAsRoot").checked = Boolean(rule.shellRunAsRoot);
+    $("#shellTestOutput").hidden = true;
+  }
   if (appRule) {
     $("#appSearch").value = "";
     $("#appFreeform").checked = Boolean(rule.freeform);
@@ -626,6 +666,8 @@ function openEditor(mode, index = null, requestedType = "keys", draftPart = "") 
     ? { source: draft?.source || [], target: [] }
     : draftPart === "target" && type === "app"
       ? { source: draft?.source || [], target: [], component: draft?.component || "", freeform: draft?.freeform, closeOnRepeat: draft?.closeOnRepeat }
+      : draftPart === "target" && type === "shell"
+        ? { source: draft?.source || [], shellCommand: draft?.shellCommand || "", shellRunAsRoot: draft?.shellRunAsRoot }
       : { source: draft?.source || [], target: draft?.target || [] });
   $("#sourceKeys").innerHTML = keyOptions();
   $("#targetKeys").innerHTML = keyOptions();
@@ -837,6 +879,19 @@ function saveDraftPart() {
     draft.component = component;
     draft.freeform = $("#appFreeform").checked;
     draft.closeOnRepeat = $("#appCloseOnRepeat").checked;
+  } else if (state.editor.type === "shell") {
+    const shellCommand = $("#shellCommand").value.trim();
+    if (!shellCommand) {
+      setNotice("请输入要执行的 Shell 命令。", true);
+      return;
+    }
+    if (new TextEncoder().encode(shellCommand).length > 640) {
+      setNotice("Shell 命令过长，请控制在 640 字节以内。", true);
+      return;
+    }
+    draft.targetType = "shell";
+    draft.shellCommand = shellCommand;
+    draft.shellRunAsRoot = $("#shellRunAsRoot").checked;
   } else {
     const target = orderedOutputKeys(selectedOptions("#targetKeys"));
     if (target.length === 0) {
@@ -852,13 +907,20 @@ function saveDraftPart() {
 
 function saveDraftRule() {
   const draft = state.mappingUi.draft;
-  if (!draft?.source?.length || !draft.targetType || (draft.targetType === "keys" ? !draft.target?.length : !draft.component)) {
+  const hasTarget = draft?.targetType === "keys"
+    ? draft.target?.length
+    : draft?.targetType === "app"
+      ? draft.component
+      : draft?.targetType === "shell" && draft.shellCommand?.trim();
+  if (!draft?.source?.length || !hasTarget) {
     setNotice("请先完成输入按键和功能选择。", true);
     return;
   }
   const rule = draft.targetType === "app"
     ? { type: "app", source: draft.source, component: draft.component, freeform: draft.freeform, closeOnRepeat: draft.closeOnRepeat }
-    : { type: "keys", source: draft.source, target: orderedOutputKeys(draft.target) };
+    : draft.targetType === "shell"
+      ? { type: "shell", source: draft.source, shellCommand: draft.shellCommand.trim(), shellRunAsRoot: draft.shellRunAsRoot }
+      : { type: "keys", source: draft.source, target: orderedOutputKeys(draft.target) };
   state.rules.push(rule);
   state.mappingUi.draft = null;
   state.mappingUi.addOpen = false;
@@ -890,6 +952,17 @@ function saveRule() {
       return;
     }
     rule = { type: "app", source, component, freeform: $("#appFreeform").checked, closeOnRepeat: $("#appCloseOnRepeat").checked };
+  } else if (state.editor.type === "shell") {
+    const shellCommand = $("#shellCommand").value.trim();
+    if (!shellCommand) {
+      setNotice("请输入要执行的 Shell 命令。", true);
+      return;
+    }
+    if (new TextEncoder().encode(shellCommand).length > 640) {
+      setNotice("Shell 命令过长，请控制在 640 字节以内。", true);
+      return;
+    }
+    rule = { type: "shell", source, shellCommand, shellRunAsRoot: $("#shellRunAsRoot").checked };
   } else {
     const target = orderedOutputKeys(selectedOptions("#targetKeys"));
     if (target.length === 0) {
@@ -916,6 +989,10 @@ function configText() {
       const mode = rule.freeform ? "freeform" : "normal";
       const repeatMode = rule.closeOnRepeat ? "|toggle" : "";
       lines.push(`launch=${rule.source.join("+")}=>${rule.component}|${mode}${repeatMode}`);
+  } else if (rule.type === "shell") {
+      if (!rule.shellCommand?.trim() || new TextEncoder().encode(rule.shellCommand).length > 640) return;
+      const mode = rule.shellRunAsRoot ? "root" : "shell";
+      lines.push(`shell=${rule.source.join("+")}=>${mode}|b64:${base64(rule.shellCommand)}`);
     } else {
       lines.push(`mapping=${rule.source.join("+")}=>${rule.target.join("+")}`);
     }
@@ -928,6 +1005,47 @@ function base64(text) {
   let binary = "";
   bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
   return btoa(binary);
+}
+
+function decodeBase64(encoded) {
+  const binary = atob(encoded);
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function shellTestCommand(command, runAsRoot) {
+  const encoded = base64(command);
+  const shell = `printf '%s' '${encoded}' | base64 -d | /system/bin/sh`;
+  return runAsRoot ? `su -c ${shellQuote(shell)}` : `su shell -c ${shellQuote(shell)}`;
+}
+
+function shellQuote(text) {
+  return `'${String(text).replaceAll("'", "'\\\"'\\\"'")}'`;
+}
+
+async function testShellCommand() {
+  const command = $("#shellCommand").value.trim();
+  const output = $("#shellTestOutput");
+  const button = $("#testShellCommand");
+  if (!command) {
+    setNotice("请输入要测试的 Shell 命令。", true);
+    return;
+  }
+  button.disabled = true;
+  button.textContent = "测试中";
+  output.hidden = false;
+  output.classList.remove("error");
+  output.textContent = "正在执行...";
+  try {
+    const { stdout, stderr } = await exec(shellTestCommand(command, $("#shellRunAsRoot").checked));
+    output.textContent = (stdout || stderr || "命令执行成功（没有输出）").trim();
+  } catch (error) {
+    output.textContent = `执行失败：${error.message}`;
+    output.classList.add("error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "测试命令";
+  }
 }
 
 async function applyConfig(button, busyText, readyText, successMessage) {
@@ -1037,6 +1155,7 @@ $("#openAppAction").addEventListener("click", () => switchEditorAction("app"));
 $("#useKeyAction").addEventListener("click", () => switchEditorAction("keys"));
 $("#refreshApps").addEventListener("click", () => refreshApps());
 $("#appSearch").addEventListener("input", () => renderApps());
+$("#testShellCommand").addEventListener("click", testShellCommand);
 $("#keyboardView").addEventListener("click", openKeyboardView);
 $("#closeKeyboardView").addEventListener("click", closeKeyboardView);
 $("#keyboardDone").addEventListener("click", closeKeyboardView);
@@ -1073,7 +1192,7 @@ $("#mappingList").addEventListener("click", (event) => {
   if (edit !== undefined) {
     const index = Number(edit);
     const rule = state.rules[index];
-    openEditor(rule.type === "app" ? "combo" : rule.source.length > 1 ? "combo" : "single", index, rule.type || "keys");
+    openEditor(rule.source.length > 1 ? "combo" : "single", index, rule.type || "keys");
   }
   if (remove !== undefined) {
     state.rules.splice(Number(remove), 1);

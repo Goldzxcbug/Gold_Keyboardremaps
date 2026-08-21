@@ -31,6 +31,7 @@
 #define MAX_RULES 96
 #define MAX_COMBO_KEYS 8
 #define MAX_FN_TRANSFORMS 8
+#define MAX_SHELL_COMMAND 640
 #define EVENT_SCAN_LIMIT 64
 #define OUTPUT_BATCH_EVENTS 16
 #define RULE_INDEX_WORDS ((MAX_RULES + 63) / 64)
@@ -43,6 +44,7 @@ typedef struct {
 typedef enum {
     RULE_ACTION_KEYS,
     RULE_ACTION_LAUNCH_APP,
+    RULE_ACTION_SHELL,
 } RuleAction;
 
 typedef struct {
@@ -54,6 +56,8 @@ typedef struct {
     char component[256];
     bool launch_freeform;
     bool close_on_repeat;
+    char shell_command[MAX_SHELL_COMMAND];
+    bool shell_run_as_root;
 } MappingRule;
 
 typedef struct {
@@ -185,6 +189,41 @@ static char *trim(char *text) {
         *--end = '\0';
     }
     return text;
+}
+
+static int base64_value(char character) {
+    if (character >= 'A' && character <= 'Z') return character - 'A';
+    if (character >= 'a' && character <= 'z') return character - 'a' + 26;
+    if (character >= '0' && character <= '9') return character - '0' + 52;
+    if (character == '+') return 62;
+    if (character == '/') return 63;
+    return -1;
+}
+
+static bool decode_base64(const char *encoded, char *decoded, size_t decoded_size) {
+    size_t output_size = 0;
+    unsigned int buffer = 0;
+    unsigned int bits = 0;
+    bool padding = false;
+    for (const char *cursor = encoded; *cursor != '\0'; cursor++) {
+        if (isspace((unsigned char)*cursor)) continue;
+        if (*cursor == '=') {
+            padding = true;
+            continue;
+        }
+        if (padding) return false;
+        int value = base64_value(*cursor);
+        if (value < 0) return false;
+        buffer = (buffer << 6) | (unsigned int)value;
+        bits += 6;
+        if (bits < 8) continue;
+        bits -= 8;
+        if (output_size + 1 >= decoded_size) return false;
+        decoded[output_size++] = (char)((buffer >> bits) & 0xffU);
+    }
+    if (output_size == 0) return false;
+    decoded[output_size] = '\0';
+    return true;
 }
 
 static int key_code_from_name(const char *name) {
@@ -341,6 +380,35 @@ static bool add_launch_rule(Config *config, const char *launch_text) {
     return true;
 }
 
+static bool add_shell_rule(Config *config, const char *shell_text) {
+    if (config->rule_count == MAX_RULES) return false;
+    char text[1200];
+    snprintf(text, sizeof(text), "%s", shell_text);
+    char *separator = strstr(text, "=>");
+    if (separator == NULL) return false;
+    *separator = '\0';
+    char *source_text = trim(text);
+    char *destination = trim(separator + 2);
+    char *option_separator = strchr(destination, '|');
+    if (option_separator == NULL) return false;
+    *option_separator = '\0';
+    const char *mode = trim(destination);
+    const char *encoded = trim(option_separator + 1);
+    if (strcmp(mode, "shell") != 0 && strcmp(mode, "root") != 0) return false;
+    if (strncmp(encoded, "b64:", 4) != 0) return false;
+
+    MappingRule rule = {0};
+    rule.action = RULE_ACTION_SHELL;
+    rule.shell_run_as_root = strcmp(mode, "root") == 0;
+    if (!parse_combo(source_text, rule.source, &rule.source_count) ||
+        !decode_base64(encoded + 4, rule.shell_command, sizeof(rule.shell_command))) {
+        return false;
+    }
+    if (rule.shell_command[0] == '\0') return false;
+    config->rules[config->rule_count++] = rule;
+    return true;
+}
+
 static void add_default_mappings(Config *config) {
     static const char *const mappings[] = {
         "KEY_F23=>KEY_FN",
@@ -390,7 +458,7 @@ static void load_config(Config *config) {
     }
 
     config->auto_select = false;
-    char line[384];
+    char line[1200];
     while (fgets(line, sizeof(line), file) != NULL) {
         char *value = trim(line);
         if (*value == '\0' || *value == '#') {
@@ -407,6 +475,8 @@ static void load_config(Config *config) {
             (void)add_mapping(config, trim(value + 8));
         } else if (strncmp(value, "launch=", 7) == 0) {
             (void)add_launch_rule(config, trim(value + 7));
+        } else if (strncmp(value, "shell=", 6) == 0) {
+            (void)add_shell_rule(config, trim(value + 6));
         }
     }
     fclose(file);
@@ -658,7 +728,7 @@ static void index_config_keys(Config *config) {
             if (rule->action == RULE_ACTION_KEYS) {
                 config->key_action_sources[key] = true;
                 config->trigger_rules[key][rule_index / 64] |= UINT64_C(1) << (rule_index % 64);
-            } else if (rule->action == RULE_ACTION_LAUNCH_APP) {
+            } else if (rule->action == RULE_ACTION_LAUNCH_APP || rule->action == RULE_ACTION_SHELL) {
                 if (is_modifier_key(key)) {
                     config->app_modifier_sources[key] = true;
                 }
@@ -813,6 +883,36 @@ static void launch_rule_app(const MappingRule *rule) {
     _exit(127);
 }
 
+static void launch_rule_shell(const MappingRule *rule) {
+    pid_t child = fork();
+    if (child < 0) {
+        fprintf(stderr, "fn-remap: cannot run shell command: %s\n", strerror(errno));
+        return;
+    }
+    if (child != 0) return;
+
+    int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0 ||
+        dup2(null_fd, STDOUT_FILENO) < 0 || dup2(null_fd, STDERR_FILENO) < 0) {
+        if (null_fd >= 0) close(null_fd);
+        _exit(127);
+    }
+    if (null_fd > STDERR_FILENO) close(null_fd);
+
+    setenv("PATH", "/system/bin:/system/xbin:/product/bin:/system_ext/bin:/vendor/bin:"
+                   "/vendor/xbin:/odm/bin:/data/adb/ksu/bin", 1);
+    setenv("ANDROID_ROOT", "/system", 1);
+    setenv("ANDROID_DATA", "/data", 1);
+    signal(SIGCHLD, SIG_DFL);
+    if (rule->shell_run_as_root) {
+        execl("/system/bin/su", "su", "-c", rule->shell_command, (char *)NULL);
+    } else {
+        execl("/system/bin/su", "su", "shell", "-c", rule->shell_command, (char *)NULL);
+    }
+    fprintf(stderr, "fn-remap: cannot execute shell command: %s\n", strerror(errno));
+    _exit(127);
+}
+
 static int repeat_rule_target(DeviceContext *device, const MappingRule *rule,
                               const struct input_event *original) {
     for (size_t index = 0; index < rule->target_count; index++) {
@@ -847,6 +947,10 @@ static int activate_rule(DeviceContext *device, const Config *config, size_t rul
     }
     if (rule->action == RULE_ACTION_LAUNCH_APP) {
         launch_rule_app(rule);
+        return 0;
+    }
+    if (rule->action == RULE_ACTION_SHELL) {
+        launch_rule_shell(rule);
         return 0;
     }
     return press_rule_target(device, rule, event);

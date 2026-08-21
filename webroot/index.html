@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#f4f6f8">
   <title>Gold Keyboard Remaps</title>
-  <link rel="stylesheet" href="style.css?v=20260819-mapping-draft-1">
+  <link rel="stylesheet" href="style.css?v=20260821-shell-action-1">
 </head>
 <body>
   <header class="topbar">
@@ -92,6 +92,11 @@
                 <span><strong>打开应用</strong><small data-add-selection="target-app">选择要打开的应用</small></span>
                 <span class="add-option-arrow" aria-hidden="true">›</span>
               </button>
+              <button class="add-option" type="button" data-add-role="target" data-add-mode="single" data-add-type="shell">
+                <span class="add-option-icon">›_</span>
+                <span><strong>自定义 Shell 命令</strong><small data-add-selection="target-shell">编辑要执行的命令</small></span>
+                <span class="add-option-arrow" aria-hidden="true">›</span>
+              </button>
             </div>
           </div>
           <div class="draft-summary" aria-live="polite">
@@ -131,6 +136,13 @@
           <label class="check-line"><input id="appCloseOnRepeat" type="checkbox"><span>再次按下时关闭 App（保留后台）</span></label>
           <small>小窗模式取决于系统与应用是否支持；不支持时可能由系统以普通窗口打开。</small>
         </label>
+        <label id="shellTargetField" class="field" hidden>
+          <span class="field-heading"><span>自定义 Shell 命令</span><button id="testShellCommand" class="button ghost capture-button" type="button">测试命令</button></span>
+          <textarea id="shellCommand" class="shell-command" rows="6" placeholder="例如：input keyevent HOME" spellcheck="false" autocomplete="off"></textarea>
+          <label class="check-line"><input id="shellRunAsRoot" type="checkbox"><span>使用 root 权限执行</span></label>
+          <output id="shellTestOutput" class="shell-test-output" aria-live="polite" hidden></output>
+          <small>未勾选时使用 Android shell 用户（与 adb shell 相同权限）；勾选后使用 KernelSU root。命令将在按下映射按键时执行。</small>
+        </label>
       </div>
       <div class="editor-actions">
         <span id="editorMode" class="mode-label">单键映射</span>
@@ -164,6 +176,6 @@
       </div>
     </footer>
   </main>
-  <script type="module" src="app.js?v=20260819-mapping-draft-1"></script>
+  <script type="module" src="app.js?v=20260821-shell-action-1"></script>
 </body>
 </html>
