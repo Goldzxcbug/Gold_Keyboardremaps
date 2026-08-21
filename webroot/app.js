@@ -308,6 +308,12 @@ function parseConfig(text) {
       }
       if (!command.trim() || (mode !== "shell" && mode !== "root")) continue;
       state.rules.push({ type: "shell", source: source.split("+").filter(Boolean), shellCommand: command, shellRunAsRoot: mode === "root" });
+      continue;
+    }
+    if (line.startsWith("screenshot=")) {
+      const [source, mode] = line.slice(11).split("=>");
+      if (!source || !["normal", "long", "area"].includes(mode)) continue;
+      state.rules.push({ type: "screenshot", source: source.split("+").filter(Boolean), screenshotMode: mode });
     }
   }
 }
@@ -465,6 +471,10 @@ function chips(keys) {
   return keys.map((key) => `<span class="key-chip" title="${html(key)}">${html(keyLabel(key))}</span>`).join("");
 }
 
+function screenshotLabel(mode) {
+  return ({ normal: "截屏", long: "长截屏", area: "区域截屏" })[mode] || "截屏";
+}
+
 function ruleTarget(rule) {
   if (rule.type === "app") {
     return `<span class="app-chip" title="${html(rule.component)}">打开 ${html(appRuleLabel(rule))}</span>${rule.freeform ? '<span class="app-window-chip">小窗</span>' : ""}${rule.closeOnRepeat ? '<span class="app-window-chip">重复关闭</span>' : ""}`;
@@ -473,6 +483,9 @@ function ruleTarget(rule) {
     const command = String(rule.shellCommand || "").replace(/\s+/g, " ").trim();
     const label = command.length > 72 ? `${command.slice(0, 69)}...` : command;
     return `<span class="shell-chip" title="${html(rule.shellCommand || "")}">执行 ${html(label)}</span><span class="app-window-chip">${rule.shellRunAsRoot ? "root" : "shell"}</span>`;
+  }
+  if (rule.type === "screenshot") {
+    return `<span class="app-chip">${html(screenshotLabel(rule.screenshotMode))}</span>`;
   }
   return chips(rule.target || []);
 }
@@ -517,7 +530,7 @@ function updateMappingPanel() {
   const draft = state.mappingUi.draft;
   if (!draft) return;
   const sourceOption = document.querySelector(`[data-add-role="source"][data-add-mode="${draft.sourceMode || ""}"]`);
-  const targetOption = document.querySelector(`[data-add-role="target"][data-add-type="${draft.targetType || ""}"]`);
+  const targetOption = document.querySelector(`[data-add-role="target"][data-add-type="${draft.targetType === "screenshot" ? "app" : draft.targetType || ""}"]`);
   [sourceOption, targetOption].forEach((option) => {
     if (!option) return;
     option.classList.add("selected");
@@ -527,7 +540,11 @@ function updateMappingPanel() {
     "source-single": draft.sourceMode === "single" && draft.source?.length ? `已选：${draft.source.map(keyLabel).join("、")}` : "选择一个输入按键",
     "source-combo": draft.sourceMode === "combo" && draft.source?.length ? `已选：${draft.source.map(keyLabel).join("、")}` : "选择多个输入按键",
     "target-keys": draft.targetType === "keys" && draft.target?.length ? `已选：${draft.target.map(keyLabel).join("、")}` : "选择输出按键",
-    "target-app": draft.targetType === "app" && draft.component ? `已选：${readableAppName(draft.component)}` : "选择要打开的应用",
+    "target-app": draft.targetType === "app" && draft.component
+      ? `已选：${readableAppName(draft.component)}`
+      : draft.targetType === "screenshot" && draft.screenshotMode
+        ? `已选：ColorOS ${screenshotLabel(draft.screenshotMode)}`
+        : "选择要打开的应用",
     "target-shell": draft.targetType === "shell" && draft.shellCommand ? `已选：${draft.shellCommand.replace(/\s+/g, " ").trim().slice(0, 42)}` : "编辑要执行的命令",
   };
   document.querySelectorAll("[data-add-selection]").forEach((element) => {
@@ -535,7 +552,8 @@ function updateMappingPanel() {
   });
   const ready = Boolean(draft.source?.length && draft.targetType && (
     draft.targetType === "keys" ? draft.target?.length :
-      draft.targetType === "app" ? draft.component : draft.shellCommand?.trim()
+      draft.targetType === "app" ? draft.component :
+        draft.targetType === "screenshot" ? draft.screenshotMode : draft.shellCommand?.trim()
   ));
   $("#draftStatus").textContent = ready ? "输入和功能已完成，可以保存规则" : "请先选择输入按键和功能";
   $("#saveDraftRule").disabled = !ready;
@@ -544,7 +562,7 @@ function updateMappingPanel() {
 function openAddMapping() {
   state.mappingUi.expanded = false;
   state.mappingUi.addOpen = true;
-  state.mappingUi.draft = { sourceMode: null, source: [], targetType: null, target: [], component: "", freeform: false, closeOnRepeat: false, shellCommand: "", shellRunAsRoot: false };
+  state.mappingUi.draft = { sourceMode: null, source: [], targetType: null, target: [], component: "", freeform: false, closeOnRepeat: false, shellCommand: "", shellRunAsRoot: false, screenshotMode: "" };
   updateMappingPanel();
   $("#mappingAddPanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
@@ -560,13 +578,16 @@ function chooseMappingPart(option) {
   const role = option.dataset.addRole;
   const mode = option.dataset.addMode || "single";
   const type = role === "target" ? option.dataset.addType : "keys";
-  const draft = state.mappingUi.draft || { sourceMode: null, source: [], targetType: null, target: [], component: "", freeform: false, closeOnRepeat: false, shellCommand: "", shellRunAsRoot: false };
+  const draft = state.mappingUi.draft || { sourceMode: null, source: [], targetType: null, target: [], component: "", freeform: false, closeOnRepeat: false, shellCommand: "", shellRunAsRoot: false, screenshotMode: "" };
   state.mappingUi.draft = draft;
   if (role === "source") {
     draft.sourceMode = mode;
     openEditor(mode, null, "keys", "source");
   } else {
     draft.targetType = type;
+    if (type === "screenshot") {
+      draft.screenshotMode = option.dataset.screenshotMode || "normal";
+    }
     openEditor(draft.sourceMode || "single", null, type, "target");
   }
 }
@@ -609,36 +630,56 @@ function configureEditorAction(type, rule = {}) {
   if (!state.editor) return;
   const appRule = type === "app";
   const shellRule = type === "shell";
+  const screenshotRule = type === "screenshot";
   const draftPart = state.editor.draftPart;
   state.editor.type = type;
+  if (screenshotRule) {
+    state.editor.appMode = "coloros";
+    state.editor.pendingScreenshotMode = rule.screenshotMode || state.editor.pendingScreenshotMode || "";
+  } else if (appRule && !state.editor.appMode) {
+    state.editor.appMode = "app";
+  }
+  const appEditor = appRule || screenshotRule;
+  const colorOsMode = appEditor && state.editor.appMode === "coloros";
   $("#sourceKeyField").hidden = draftPart === "target";
-  $("#keyTargetField").hidden = appRule || shellRule || draftPart === "source";
-  $("#appTargetField").hidden = !appRule || draftPart === "source";
+  $("#keyTargetField").hidden = appEditor || shellRule || draftPart === "source";
+  $("#appTargetField").hidden = !appEditor || draftPart === "source";
   $("#shellTargetField").hidden = !shellRule || draftPart === "source";
-  $("#openAppAction").hidden = appRule || draftPart === "source";
-  $("#useKeyAction").hidden = !appRule || draftPart === "source";
+  $("#appModePanel").hidden = !appEditor || colorOsMode;
+  $("#colorOsModePanel").hidden = !appEditor || !colorOsMode;
+  $("#appModeToggle").hidden = !appEditor || draftPart === "source";
+  $("#appTargetHeading").textContent = colorOsMode ? "ColorOS 专属" : "打开应用";
+  $("#appModeToggle").textContent = colorOsMode ? "打开应用" : "ColorOS 专属";
+  $("#appModeToggle").classList.remove("selected");
+  $("#appModeToggle").setAttribute("aria-pressed", String(colorOsMode));
+  $("#refreshApps").hidden = !appEditor || colorOsMode;
+  document.querySelectorAll("[data-coloros-screenshot]").forEach((button) => {
+    const selected = colorOsMode && button.dataset.colorosScreenshot === state.editor.pendingScreenshotMode;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  });
   const creating = state.editor.index === null;
   $("#editorTitle").textContent = draftPart === "source"
     ? (state.editor.mode === "combo" ? "选择组合输入" : "选择单键输入")
     : draftPart === "target"
-      ? (appRule ? "选择打开应用" : shellRule ? "编辑 Shell 命令" : "选择按键输出")
-      : creating ? (appRule ? "新建应用映射" : shellRule ? "新建 Shell 规则" : "新建映射") : (appRule ? "编辑应用映射" : shellRule ? "编辑 Shell 规则" : "编辑映射");
-  $("#editorMode").textContent = appRule
-    ? `${state.editor.mode === "combo" ? "组合键" : "单键"} · 打开应用`
+      ? (appEditor ? (colorOsMode ? "选择 ColorOS 功能" : "选择打开应用") : shellRule ? "编辑 Shell 命令" : "选择按键输出")
+      : creating ? (appEditor ? (colorOsMode ? "新建 ColorOS 规则" : "新建应用映射") : shellRule ? "新建 Shell 规则" : "新建映射") : (appEditor ? (colorOsMode ? "编辑 ColorOS 规则" : "编辑应用映射") : shellRule ? "编辑 Shell 规则" : "编辑映射");
+  $("#editorMode").textContent = appEditor
+    ? `${state.editor.mode === "combo" ? "组合键" : "单键"} · ${colorOsMode ? "ColorOS 专属" : "打开应用"}`
     : shellRule
       ? `${state.editor.mode === "combo" ? "组合键" : "单键"} · Shell 命令`
       : state.editor.mode === "combo" ? "组合键映射" : "单键映射";
   $("#saveRule").textContent = state.editor?.draftPart
     ? "完成选择"
     : creating
-      ? (appRule ? "加入应用规则" : shellRule ? "加入 Shell 规则" : "加入规则")
-      : (appRule ? "更新应用规则" : shellRule ? "更新 Shell 规则" : "更新规则");
+      ? (appEditor ? (colorOsMode ? "完成选择" : "加入应用规则") : shellRule ? "加入 Shell 规则" : "加入规则")
+      : (appEditor ? (colorOsMode ? "完成选择" : "更新应用规则") : shellRule ? "更新 Shell 规则" : "更新规则");
   if (shellRule) {
     $("#shellCommand").value = rule.shellCommand || "";
     $("#shellRunAsRoot").checked = Boolean(rule.shellRunAsRoot);
     $("#shellTestOutput").hidden = true;
   }
-  if (appRule) {
+  if (appRule && !colorOsMode) {
     $("#appSearch").value = "";
     $("#appFreeform").checked = Boolean(rule.freeform);
     $("#appCloseOnRepeat").checked = Boolean(rule.closeOnRepeat);
@@ -647,12 +688,24 @@ function configureEditorAction(type, rule = {}) {
   }
 }
 
-function switchEditorAction(type) {
+function toggleAppEditorMode() {
+  if (!state.editor || (state.editor.type !== "app" && state.editor.type !== "screenshot")) return;
+  const enteringColorOs = state.editor.appMode !== "coloros";
+  state.editor.appMode = enteringColorOs ? "coloros" : "app";
+  state.editor.type = enteringColorOs ? "screenshot" : "app";
+  configureEditorAction(state.editor.type, {
+    component: $("#appTarget").value,
+    freeform: $("#appFreeform").checked,
+    closeOnRepeat: $("#appCloseOnRepeat").checked,
+    screenshotMode: state.editor.pendingScreenshotMode,
+  });
+}
+
+function chooseColorOsScreenshot(mode) {
+  if (!["normal", "long", "area"].includes(mode)) return;
   if (!state.editor) return;
-  const appRule = type === "app"
-    ? { component: $("#appTarget").value, freeform: $("#appFreeform").checked, closeOnRepeat: $("#appCloseOnRepeat").checked }
-    : {};
-  configureEditorAction(type, appRule);
+  state.editor.pendingScreenshotMode = mode;
+  configureEditorAction("screenshot", { screenshotMode: mode });
 }
 
 function openEditor(mode, index = null, requestedType = "keys", draftPart = "") {
@@ -666,8 +719,10 @@ function openEditor(mode, index = null, requestedType = "keys", draftPart = "") 
     ? { source: draft?.source || [], target: [] }
     : draftPart === "target" && type === "app"
       ? { source: draft?.source || [], target: [], component: draft?.component || "", freeform: draft?.freeform, closeOnRepeat: draft?.closeOnRepeat }
-      : draftPart === "target" && type === "shell"
+    : draftPart === "target" && type === "shell"
         ? { source: draft?.source || [], shellCommand: draft?.shellCommand || "", shellRunAsRoot: draft?.shellRunAsRoot }
+      : draftPart === "target" && type === "screenshot"
+        ? { source: draft?.source || [], screenshotMode: draft?.screenshotMode || "normal" }
       : { source: draft?.source || [], target: draft?.target || [] });
   $("#sourceKeys").innerHTML = keyOptions();
   $("#targetKeys").innerHTML = keyOptions();
@@ -892,6 +947,13 @@ function saveDraftPart() {
     draft.targetType = "shell";
     draft.shellCommand = shellCommand;
     draft.shellRunAsRoot = $("#shellRunAsRoot").checked;
+  } else if (state.editor.type === "screenshot") {
+    if (!["normal", "long", "area"].includes(state.editor.pendingScreenshotMode)) {
+      setNotice("请选择一个 ColorOS 截图功能。", true);
+      return;
+    }
+    draft.targetType = "screenshot";
+    draft.screenshotMode = state.editor.pendingScreenshotMode;
   } else {
     const target = orderedOutputKeys(selectedOptions("#targetKeys"));
     if (target.length === 0) {
@@ -911,7 +973,9 @@ function saveDraftRule() {
     ? draft.target?.length
     : draft?.targetType === "app"
       ? draft.component
-      : draft?.targetType === "shell" && draft.shellCommand?.trim();
+      : draft?.targetType === "screenshot"
+        ? draft.screenshotMode
+        : draft?.targetType === "shell" && draft.shellCommand?.trim();
   if (!draft?.source?.length || !hasTarget) {
     setNotice("请先完成输入按键和功能选择。", true);
     return;
@@ -920,6 +984,8 @@ function saveDraftRule() {
     ? { type: "app", source: draft.source, component: draft.component, freeform: draft.freeform, closeOnRepeat: draft.closeOnRepeat }
     : draft.targetType === "shell"
       ? { type: "shell", source: draft.source, shellCommand: draft.shellCommand.trim(), shellRunAsRoot: draft.shellRunAsRoot }
+      : draft.targetType === "screenshot"
+        ? { type: "screenshot", source: draft.source, screenshotMode: draft.screenshotMode }
       : { type: "keys", source: draft.source, target: orderedOutputKeys(draft.target) };
   state.rules.push(rule);
   state.mappingUi.draft = null;
@@ -963,6 +1029,12 @@ function saveRule() {
       return;
     }
     rule = { type: "shell", source, shellCommand, shellRunAsRoot: $("#shellRunAsRoot").checked };
+  } else if (state.editor.type === "screenshot") {
+    if (!["normal", "long", "area"].includes(state.editor.pendingScreenshotMode)) {
+      setNotice("请选择一个 ColorOS 截图功能。", true);
+      return;
+    }
+    rule = { type: "screenshot", source, screenshotMode: state.editor.pendingScreenshotMode };
   } else {
     const target = orderedOutputKeys(selectedOptions("#targetKeys"));
     if (target.length === 0) {
@@ -989,10 +1061,14 @@ function configText() {
       const mode = rule.freeform ? "freeform" : "normal";
       const repeatMode = rule.closeOnRepeat ? "|toggle" : "";
       lines.push(`launch=${rule.source.join("+")}=>${rule.component}|${mode}${repeatMode}`);
-  } else if (rule.type === "shell") {
+    } else if (rule.type === "shell") {
       if (!rule.shellCommand?.trim() || new TextEncoder().encode(rule.shellCommand).length > 640) return;
       const mode = rule.shellRunAsRoot ? "root" : "shell";
       lines.push(`shell=${rule.source.join("+")}=>${mode}|b64:${base64(rule.shellCommand)}`);
+    } else if (rule.type === "screenshot") {
+      if (["normal", "long", "area"].includes(rule.screenshotMode)) {
+        lines.push(`screenshot=${rule.source.join("+")}=>${rule.screenshotMode}`);
+      }
     } else {
       lines.push(`mapping=${rule.source.join("+")}=>${rule.target.join("+")}`);
     }
@@ -1015,8 +1091,17 @@ function decodeBase64(encoded) {
 
 function shellTestCommand(command, runAsRoot) {
   const encoded = base64(command);
-  const shell = `printf '%s' '${encoded}' | base64 -d | /system/bin/sh`;
-  return runAsRoot ? `su -c ${shellQuote(shell)}` : `su shell -c ${shellQuote(shell)}`;
+  const runner = runAsRoot ? "/system/bin/sh" : "su shell -c /system/bin/sh";
+  const shell = [
+    "result_file=/data/local/tmp/gold-keyboardremaps-shell-test.$$.out",
+    `printf '%s' '${encoded}' | base64 -d | ${runner} >\"$result_file\" 2>&1`,
+    "status=$?",
+    "cat \"$result_file\"",
+    "rm -f \"$result_file\"",
+    "echo __GOLD_SHELL_EXIT__=$status",
+    "exit 0",
+  ].join("; ");
+  return shell;
 }
 
 function shellQuote(text) {
@@ -1037,8 +1122,18 @@ async function testShellCommand() {
   output.classList.remove("error");
   output.textContent = "正在执行...";
   try {
-    const { stdout, stderr } = await exec(shellTestCommand(command, $("#shellRunAsRoot").checked));
-    output.textContent = (stdout || stderr || "命令执行成功（没有输出）").trim();
+    const { status: bridgeStatus, stdout, stderr } = await execShellTest(shellTestCommand(command, $("#shellRunAsRoot").checked));
+    const combined = `${stdout || ""}${stderr || ""}`;
+    const match = combined.match(/(?:^|\n)__GOLD_SHELL_EXIT__=(\d+)\s*$/);
+    const exitCode = match ? Number(match[1]) : null;
+    const content = (match ? combined.slice(0, match.index) : combined).trimEnd();
+    if (exitCode === 0) {
+      output.textContent = content || "命令执行成功（没有输出）";
+    } else {
+      const status = exitCode === null ? bridgeStatus : exitCode;
+      output.textContent = `${content || "命令没有输出"}${status === 0 ? "" : `\n[exit code: ${status}]`}`;
+      output.classList.add("error");
+    }
   } catch (error) {
     output.textContent = `执行失败：${error.message}`;
     output.classList.add("error");
@@ -1046,6 +1141,26 @@ async function testShellCommand() {
     button.disabled = false;
     button.textContent = "测试命令";
   }
+}
+
+function execShellTest(command) {
+  const bridge = ksuBridge();
+  if (!bridge) {
+    return Promise.reject(new Error("未检测到 KernelSU WebUI API，请从 KernelSU Manager 打开本页面。"));
+  }
+  return new Promise((resolve, reject) => {
+    const callback = `gold_keyboardremaps_shell_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    window[callback] = (status, stdout, stderr) => {
+      delete window[callback];
+      resolve({ status: Number(status) || 0, stdout: stdout || "", stderr: stderr || "" });
+    };
+    try {
+      bridge.exec(command, JSON.stringify({}), callback);
+    } catch (error) {
+      delete window[callback];
+      reject(error);
+    }
+  });
 }
 
 async function applyConfig(button, busyText, readyText, successMessage) {
@@ -1151,8 +1266,11 @@ $("#saveRule").addEventListener("click", saveRule);
 $("#saveDraftRule").addEventListener("click", saveDraftRule);
 $("#captureSource").addEventListener("click", () => captureKeys("#sourceKeys"));
 $("#captureTarget").addEventListener("click", () => captureKeys("#targetKeys"));
-$("#openAppAction").addEventListener("click", () => switchEditorAction("app"));
-$("#useKeyAction").addEventListener("click", () => switchEditorAction("keys"));
+$("#appModeToggle").addEventListener("click", toggleAppEditorMode);
+$("#colorOsModePanel").addEventListener("click", (event) => {
+  const mode = event.target.closest("[data-coloros-screenshot]")?.dataset.colorosScreenshot;
+  if (mode) chooseColorOsScreenshot(mode);
+});
 $("#refreshApps").addEventListener("click", () => refreshApps());
 $("#appSearch").addEventListener("input", () => renderApps());
 $("#testShellCommand").addEventListener("click", testShellCommand);

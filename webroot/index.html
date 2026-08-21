@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#f4f6f8">
   <title>Gold Keyboard Remaps</title>
-  <link rel="stylesheet" href="style.css?v=20260821-shell-action-1">
+  <link rel="stylesheet" href="style.css?v=20260821-coloros-action-5">
 </head>
 <body>
   <header class="topbar">
@@ -124,24 +124,37 @@
         </label>
         <div id="ruleArrow" class="rule-arrow" aria-hidden="true">→</div>
         <label id="keyTargetField" class="field">
-          <span class="field-heading"><span>输出键</span><span class="capture-actions"><button id="openAppAction" class="button ghost capture-button" type="button">打开应用</button><button id="keyboardView" class="button ghost capture-button" type="button">键盘视图</button><button id="captureTarget" class="button ghost capture-button" type="button">捕获按键 5 秒</button></span></span>
+          <span class="field-heading"><span>输出键</span><span class="capture-actions"><button id="keyboardView" class="button ghost capture-button" type="button">键盘视图</button><button id="captureTarget" class="button ghost capture-button" type="button">捕获按键 5 秒</button></span></span>
           <select id="targetKeys" multiple size="7"></select>
           <small>多项输出会同时按下，松开时反向释放</small>
         </label>
         <label id="appTargetField" class="field" hidden>
-          <span class="field-heading"><span>打开应用</span><span class="capture-actions"><button id="useKeyAction" class="button ghost capture-button" type="button">使用按键输出</button><button id="refreshApps" class="button ghost capture-button" type="button">刷新应用</button></span></span>
-          <input id="appSearch" class="app-search" type="search" placeholder="搜索应用名称或包名" autocomplete="off">
-          <select id="appTarget" size="7" aria-label="选择要打开的应用"></select>
-          <label class="check-line"><input id="appFreeform" type="checkbox"><span>以小窗形式打开</span></label>
-          <label class="check-line"><input id="appCloseOnRepeat" type="checkbox"><span>再次按下时关闭 App（保留后台）</span></label>
-          <small>小窗模式取决于系统与应用是否支持；不支持时可能由系统以普通窗口打开。</small>
+          <span class="field-heading"><span id="appTargetHeading">打开应用</span><span class="capture-actions"><button id="appModeToggle" class="button ghost capture-button" type="button" aria-pressed="false">ColorOS 专属</button><button id="refreshApps" class="button ghost capture-button" type="button">刷新应用</button></span></span>
+          <div id="appModePanel">
+            <input id="appSearch" class="app-search" type="search" placeholder="搜索应用名称或包名" autocomplete="off">
+            <select id="appTarget" size="7" aria-label="选择要打开的应用"></select>
+            <label class="check-line"><input id="appFreeform" type="checkbox"><span>以小窗形式打开</span></label>
+            <label class="check-line"><input id="appCloseOnRepeat" type="checkbox"><span>再次按下时关闭 App（保留后台）</span></label>
+            <small>小窗模式取决于系统与应用是否支持；不支持时可能由系统以普通窗口打开。</small>
+          </div>
+          <div id="colorOsModePanel" class="coloros-action-menu" hidden>
+            <div class="coloros-action-heading">ColorOS 专属</div>
+            <div class="coloros-action-section">
+              <span class="coloros-action-section-title">截图</span>
+              <div class="coloros-action-options">
+                <button class="button ghost" type="button" data-coloros-screenshot="normal">截屏</button>
+                <button class="button ghost" type="button" data-coloros-screenshot="long">长截屏</button>
+                <button class="button ghost" type="button" data-coloros-screenshot="area">区域截屏</button>
+              </div>
+            </div>
+            <small>选择功能后，点击底部“完成选择”保存。</small>
+          </div>
         </label>
         <label id="shellTargetField" class="field" hidden>
           <span class="field-heading"><span>自定义 Shell 命令</span><button id="testShellCommand" class="button ghost capture-button" type="button">测试命令</button></span>
           <textarea id="shellCommand" class="shell-command" rows="6" placeholder="例如：input keyevent HOME" spellcheck="false" autocomplete="off"></textarea>
           <label class="check-line"><input id="shellRunAsRoot" type="checkbox"><span>使用 root 权限执行</span></label>
           <output id="shellTestOutput" class="shell-test-output" aria-live="polite" hidden></output>
-          <small>未勾选时使用 Android shell 用户（与 adb shell 相同权限）；勾选后使用 KernelSU root。命令将在按下映射按键时执行。</small>
         </label>
       </div>
       <div class="editor-actions">
@@ -176,6 +189,6 @@
       </div>
     </footer>
   </main>
-  <script type="module" src="app.js?v=20260821-shell-action-1"></script>
+  <script type="module" src="app.js?v=20260821-coloros-action-5"></script>
 </body>
 </html>

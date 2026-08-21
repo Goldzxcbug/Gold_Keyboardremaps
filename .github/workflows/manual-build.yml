@@ -99,10 +99,10 @@ jobs:
           file build/module/bin/fn-remap | grep -F "$expected_machine"
 
           javac -source 8 -target 8 -cp "$android_jar" -d build/java-classes \
-            ColorOsWindowLauncher.java
+            ColorOS.java
           "$d8" --min-api "$ANDROID_API" --lib "$android_jar" \
             --output build/module/bin/coloros-window-launcher.jar \
-            build/java-classes/gold/keyboardremaps/ColorOsWindowLauncher.class
+            build/java-classes/gold/keyboardremaps/ColorOS.class
           unzip -l build/module/bin/coloros-window-launcher.jar | grep -F 'classes.dex'
 
           install -m 0644 module.prop config.conf build/module/

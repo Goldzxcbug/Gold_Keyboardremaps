@@ -23,7 +23,9 @@
 #define CONFIG_PATH "/data/adb/modules/Gold_Keyboardremaps/config.conf"
 #define VIRTUAL_NAME_PREFIX "Gold Keyboardremaps"
 #define COLOROS_WINDOW_LAUNCHER "/data/adb/modules/Gold_Keyboardremaps/bin/coloros-window-launcher.jar"
-#define COLOROS_WINDOW_LAUNCHER_CLASS "gold.keyboardremaps.ColorOsWindowLauncher"
+#define COLOROS_WINDOW_LAUNCHER_CLASS "gold.keyboardremaps.ColorOS"
+#define COLOROS_SCREENSHOT_LAUNCHER "/data/adb/modules/Gold_Keyboardremaps/bin/coloros-window-launcher.jar"
+#define COLOROS_SCREENSHOT_LAUNCHER_CLASS "gold.keyboardremaps.ColorOS"
 #define VIRTUAL_VENDOR 0x22d9
 #define VIRTUAL_PRODUCT 0x386a
 #define RETRY_DELAY_SECONDS 2
@@ -45,7 +47,14 @@ typedef enum {
     RULE_ACTION_KEYS,
     RULE_ACTION_LAUNCH_APP,
     RULE_ACTION_SHELL,
+    RULE_ACTION_SCREENSHOT,
 } RuleAction;
+
+typedef enum {
+    SCREENSHOT_NORMAL,
+    SCREENSHOT_LONG,
+    SCREENSHOT_AREA,
+} ScreenshotMode;
 
 typedef struct {
     int source[MAX_COMBO_KEYS];
@@ -58,6 +67,7 @@ typedef struct {
     bool close_on_repeat;
     char shell_command[MAX_SHELL_COMMAND];
     bool shell_run_as_root;
+    ScreenshotMode screenshot_mode;
 } MappingRule;
 
 typedef struct {
@@ -409,6 +419,33 @@ static bool add_shell_rule(Config *config, const char *shell_text) {
     return true;
 }
 
+static bool add_screenshot_rule(Config *config, const char *screenshot_text) {
+    if (config->rule_count == MAX_RULES) return false;
+    char text[384];
+    snprintf(text, sizeof(text), "%s", screenshot_text);
+    char *separator = strstr(text, "=>");
+    if (separator == NULL) return false;
+    *separator = '\0';
+    char *source_text = trim(text);
+    char *mode = trim(separator + 2);
+    MappingRule rule = {0};
+    rule.action = RULE_ACTION_SCREENSHOT;
+    if (strcmp(mode, "normal") == 0) {
+        rule.screenshot_mode = SCREENSHOT_NORMAL;
+    } else if (strcmp(mode, "long") == 0) {
+        rule.screenshot_mode = SCREENSHOT_LONG;
+    } else if (strcmp(mode, "area") == 0) {
+        rule.screenshot_mode = SCREENSHOT_AREA;
+    } else {
+        return false;
+    }
+    if (!parse_combo(source_text, rule.source, &rule.source_count)) {
+        return false;
+    }
+    config->rules[config->rule_count++] = rule;
+    return true;
+}
+
 static void add_default_mappings(Config *config) {
     static const char *const mappings[] = {
         "KEY_F23=>KEY_FN",
@@ -477,6 +514,8 @@ static void load_config(Config *config) {
             (void)add_launch_rule(config, trim(value + 7));
         } else if (strncmp(value, "shell=", 6) == 0) {
             (void)add_shell_rule(config, trim(value + 6));
+        } else if (strncmp(value, "screenshot=", 11) == 0) {
+            (void)add_screenshot_rule(config, trim(value + 11));
         }
     }
     fclose(file);
@@ -728,7 +767,9 @@ static void index_config_keys(Config *config) {
             if (rule->action == RULE_ACTION_KEYS) {
                 config->key_action_sources[key] = true;
                 config->trigger_rules[key][rule_index / 64] |= UINT64_C(1) << (rule_index % 64);
-            } else if (rule->action == RULE_ACTION_LAUNCH_APP || rule->action == RULE_ACTION_SHELL) {
+            } else if (rule->action == RULE_ACTION_LAUNCH_APP ||
+                       rule->action == RULE_ACTION_SHELL ||
+                       rule->action == RULE_ACTION_SCREENSHOT) {
                 if (is_modifier_key(key)) {
                     config->app_modifier_sources[key] = true;
                 }
@@ -883,6 +924,49 @@ static void launch_rule_app(const MappingRule *rule) {
     _exit(127);
 }
 
+static void launch_rule_screenshot(const MappingRule *rule) {
+    const char *mode = "normal";
+    if (rule->screenshot_mode == SCREENSHOT_LONG) {
+        mode = "long";
+    } else if (rule->screenshot_mode == SCREENSHOT_AREA) {
+        mode = "area";
+    }
+
+    char command[512];
+    int length = snprintf(command, sizeof(command),
+                          "CLASSPATH='%s' exec /system/bin/app_process /system/bin %s %s",
+                          COLOROS_SCREENSHOT_LAUNCHER, COLOROS_SCREENSHOT_LAUNCHER_CLASS, mode);
+    if (length < 0 || (size_t)length >= sizeof(command)) {
+        fprintf(stderr, "fn-remap: screenshot command is too long\n");
+        return;
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        fprintf(stderr, "fn-remap: cannot launch screenshot: %s\n", strerror(errno));
+        return;
+    }
+    if (child != 0) {
+        return;
+    }
+
+    int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0 ||
+        dup2(null_fd, STDOUT_FILENO) < 0 || dup2(null_fd, STDERR_FILENO) < 0) {
+        if (null_fd >= 0) close(null_fd);
+        _exit(127);
+    }
+    if (null_fd > STDERR_FILENO) close(null_fd);
+
+    setenv("PATH", "/system/bin:/system/xbin:/product/bin:/system_ext/bin:/vendor/bin:"
+                   "/vendor/xbin:/odm/bin:/data/adb/ksu/bin", 1);
+    setenv("ANDROID_ROOT", "/system", 1);
+    setenv("ANDROID_DATA", "/data", 1);
+    signal(SIGCHLD, SIG_DFL);
+    execl("/system/bin/su", "su", "-c", command, (char *)NULL);
+    _exit(127);
+}
+
 static void launch_rule_shell(const MappingRule *rule) {
     pid_t child = fork();
     if (child < 0) {
@@ -951,6 +1035,10 @@ static int activate_rule(DeviceContext *device, const Config *config, size_t rul
     }
     if (rule->action == RULE_ACTION_SHELL) {
         launch_rule_shell(rule);
+        return 0;
+    }
+    if (rule->action == RULE_ACTION_SCREENSHOT) {
+        launch_rule_screenshot(rule);
         return 0;
     }
     return press_rule_target(device, rule, event);

@@ -15,7 +15,7 @@ Gold Keyboard Remaps 是一个 KernelSU 模块。它拦截指定的 Linux 输入
 - 已获得 root，并安装支持 WebUI 的 KernelSU Manager。
 - 设备内核提供 `/dev/uinput`，外接键盘能出现在 `/dev/input/event*`。
 - 模块必须包含编译好的 `bin/fn-remap`，并具有 `0755` 权限。
-- 只有使用 ColorOS 小窗规则时才需要 `bin/coloros-window-launcher.jar`；普通按键映射和普通应用启动不依赖它。
+- 只有使用 ColorOS 小窗或系统截屏规则时才需要 `bin/coloros-window-launcher.jar`；普通按键映射和普通应用启动不依赖它。
 
 ## 安装
 
@@ -50,7 +50,7 @@ Gold_Keyboardremaps/
     └── style.css
 ```
 
-`fn_remap.c` 需要使用 Android 目标架构编译为 `bin/fn-remap`。如果要启用 ColorOS 小窗，需要使用 Android SDK 的 `android.jar` 编译 `ColorOsWindowLauncher.java`，并把生成的类打包为 `bin/coloros-window-launcher.jar`。
+`fn_remap.c` 需要使用 Android 目标架构编译为 `bin/fn-remap`。如果要启用 ColorOS 小窗或系统截屏，需要使用 Android SDK 的 `android.jar` 编译 `ColorOS.java`，并把生成的类打包为 `bin/coloros-window-launcher.jar`。
 
 仓库中的 `install-webui.sh` 和 `install-into-existing-module.sh` 是刷机后更新现有模块的脚本，不是完整构建系统。它们会从 `/data/local/tmp/gold-keyboardremaps` 或 `/data/local/tmp` 读取已经准备好的二进制和脚本。
 
