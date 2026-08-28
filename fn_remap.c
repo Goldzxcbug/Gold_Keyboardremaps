@@ -28,7 +28,8 @@
 #define COLOROS_SCREENSHOT_LAUNCHER_CLASS "gold.keyboardremaps.ColorOS"
 #define VIRTUAL_VENDOR 0x22d9
 #define VIRTUAL_PRODUCT 0x386a
-#define RETRY_DELAY_SECONDS 2
+#define RETRY_DELAY_INITIAL_SECONDS 2
+#define RETRY_DELAY_MAX_SECONDS 30
 #define MAX_DEVICES 16
 #define MAX_RULES 96
 #define MAX_COMBO_KEYS 8
@@ -98,6 +99,7 @@ typedef struct {
     int virtual_fd;
     char source_path[64];
     char source_name[128];
+    struct input_id source_id;
     bool pressed[KEY_MAX + 1];
     bool pending[KEY_MAX + 1];
     bool suppressed[KEY_MAX + 1];
@@ -184,6 +186,13 @@ static void sleep_seconds(unsigned int seconds) {
     struct timespec delay = {.tv_sec = seconds, .tv_nsec = 0};
     while (nanosleep(&delay, &delay) == -1 && errno == EINTR && keep_running) {
     }
+}
+
+static unsigned int next_retry_delay(unsigned int delay) {
+    if (delay >= RETRY_DELAY_MAX_SECONDS / 2) {
+        return RETRY_DELAY_MAX_SECONDS;
+    }
+    return delay * 2;
 }
 
 static bool bit_is_set(const uint8_t *bits, unsigned int bit) {
@@ -623,6 +632,29 @@ static bool source_already_open(const DeviceContext devices[MAX_DEVICES], size_t
                                 const char *path) {
     for (size_t index = 0; index < count; index++) {
         if (strcmp(devices[index].source_path, path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_companion_keyboard_transport(const struct input_id *first,
+                                            const struct input_id *second) {
+    return (first->bustype == BUS_HOST && second->bustype == BUS_BLUETOOTH) ||
+           (first->bustype == BUS_BLUETOOTH && second->bustype == BUS_HOST);
+}
+
+static bool source_is_transport_duplicate(const DeviceContext devices[MAX_DEVICES], size_t count,
+                                          const char *name, const struct input_id *id) {
+    if (id->vendor == 0 || id->product == 0) {
+        return false;
+    }
+    for (size_t index = 0; index < count; index++) {
+        const DeviceContext *existing = &devices[index];
+        if (existing->source_id.vendor == id->vendor &&
+            existing->source_id.product == id->product &&
+            strcmp(existing->source_name, name) == 0 &&
+            is_companion_keyboard_transport(&existing->source_id, id)) {
             return true;
         }
     }
@@ -1155,7 +1187,17 @@ static int handle_source(DeviceContext *device, const Config *config) {
     struct input_event events[32];
     ssize_t count = read(device->source_fd, events, sizeof(events));
     if (count <= 0) {
-        return count < 0 && (errno == EAGAIN || errno == EINTR) ? 0 : -1;
+        if (count < 0 && (errno == EAGAIN || errno == EINTR)) {
+            // A single consumer cannot get EAGAIN after poll says POLLIN unless the
+            // input node became unreliable. Recreate it instead of spinning on it.
+            fprintf(stderr, "fn-remap: %s reported POLLIN but read no input: %s\n",
+                    device->source_path, strerror(errno));
+        }
+        return -1;
+    }
+    if ((size_t)count % sizeof(*events) != 0) {
+        fprintf(stderr, "fn-remap: %s returned a partial input event\n", device->source_path);
+        return -1;
     }
     size_t event_count = (size_t)count / sizeof(*events);
     for (size_t index = 0; index < event_count;) {
@@ -1197,7 +1239,17 @@ static int handle_virtual_output(DeviceContext *device) {
     struct input_event events[16];
     ssize_t count = read(device->virtual_fd, events, sizeof(events));
     if (count <= 0) {
-        return count < 0 && (errno == EAGAIN || errno == EINTR) ? 0 : -1;
+        if (count < 0 && (errno == EAGAIN || errno == EINTR)) {
+            fprintf(stderr, "fn-remap: virtual keyboard for %s reported POLLIN but read no "
+                            "output: %s\n",
+                    device->source_path, strerror(errno));
+        }
+        return -1;
+    }
+    if ((size_t)count % sizeof(*events) != 0) {
+        fprintf(stderr, "fn-remap: virtual keyboard for %s returned a partial input event\n",
+                device->source_path);
+        return -1;
     }
     for (ssize_t index = 0; index < count / (ssize_t)sizeof(struct input_event); index++) {
         if (events[index].type == EV_LED && write_event(device->source_fd, &events[index]) < 0) {
@@ -1223,14 +1275,25 @@ static void close_device(DeviceContext *device) {
 }
 
 static bool add_device(DeviceContext devices[MAX_DEVICES], size_t *count, int source_fd,
-                       const char *source_path, const char *source_name, const Config *config) {
-    if (*count == MAX_DEVICES || source_already_open(devices, *count, source_path)) {
+                       const char *source_path, const char *source_name,
+                       const struct input_id *source_id, const Config *config,
+                       bool skip_companion_transport) {
+    bool companion_transport =
+        skip_companion_transport &&
+        source_is_transport_duplicate(devices, *count, source_name, source_id);
+    if (*count == MAX_DEVICES || source_already_open(devices, *count, source_path) ||
+        companion_transport) {
+        if (companion_transport) {
+            fprintf(stderr, "fn-remap: skipping companion keyboard transport %s (%s)\n",
+                    source_path, source_name);
+        }
         close(source_fd);
         return false;
     }
     DeviceContext device = {.source_fd = source_fd, .virtual_fd = -1};
     snprintf(device.source_path, sizeof(device.source_path), "%s", source_path);
     snprintf(device.source_name, sizeof(device.source_name), "%s", source_name);
+    device.source_id = *source_id;
     device.virtual_fd = create_virtual_keyboard(source_fd, config, source_path);
     if (device.virtual_fd < 0) {
         fprintf(stderr, "fn-remap: cannot create virtual keyboard for %s: %s\n", source_path,
@@ -1255,7 +1318,7 @@ static void find_selected_devices(DeviceContext devices[MAX_DEVICES], size_t *co
         struct input_id id;
         int fd = open_source(selector->path, name, sizeof(name), &id);
         if (fd >= 0 && matches_selector(&id, selector)) {
-            (void)add_device(devices, count, fd, selector->path, name, config);
+            (void)add_device(devices, count, fd, selector->path, name, &id, config, false);
             continue;
         }
         if (fd >= 0) {
@@ -1273,7 +1336,7 @@ static void find_selected_devices(DeviceContext devices[MAX_DEVICES], size_t *co
                 close(fd);
                 continue;
             }
-            (void)add_device(devices, count, fd, path, name, config);
+            (void)add_device(devices, count, fd, path, name, &id, config, false);
             break;
         }
     }
@@ -1295,7 +1358,7 @@ static void find_default_device(DeviceContext devices[MAX_DEVICES], size_t *coun
             close(fd);
             continue;
         }
-        (void)add_device(devices, count, fd, path, name, config);
+        (void)add_device(devices, count, fd, path, name, &id, config, true);
     }
 }
 
@@ -1399,7 +1462,8 @@ capture_done:
     return 0;
 }
 
-static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, const Config *config) {
+static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, const Config *config,
+                           unsigned int *retry_delay) {
     struct pollfd fds[MAX_DEVICES * 2];
     while (keep_running) {
         nfds_t fd_count = 0;
@@ -1426,6 +1490,11 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, con
             struct pollfd *source = &fds[index * 2];
             if ((source->revents & POLLIN) && handle_source(&devices[index], config) < 0) {
                 return -1;
+            }
+            if (source->revents & POLLIN) {
+                // A real input event means this device has recovered; the next failure can
+                // use the short retry instead of inheriting an earlier disconnect backoff.
+                *retry_delay = RETRY_DELAY_INITIAL_SECONDS;
             }
         }
         for (size_t index = 0; index < count; index++) {
@@ -1466,6 +1535,7 @@ int main(int argc, char **argv) {
         return capture_key_events((unsigned int)seconds, collect_all);
     }
 
+    unsigned int retry_delay = RETRY_DELAY_INITIAL_SECONDS;
     while (keep_running) {
         Config config;
         load_config(&config);
@@ -1484,20 +1554,24 @@ int main(int argc, char **argv) {
             find_default_device(devices, &count, &config);
         }
         if (count == 0) {
-            fprintf(stderr, "fn-remap: no selected keyboard is available\n");
-            sleep_seconds(RETRY_DELAY_SECONDS);
+            fprintf(stderr, "fn-remap: no selected keyboard is available; retrying in %u seconds\n",
+                    retry_delay);
+            sleep_seconds(retry_delay);
+            retry_delay = next_retry_delay(retry_delay);
             continue;
         }
 
         fprintf(stderr, "fn-remap: active on %zu keyboard(s), %zu rule(s)\n", count,
                 config.rule_count);
-        (void)forward_devices(devices, count, &config);
+        (void)forward_devices(devices, count, &config, &retry_delay);
         for (size_t index = 0; index < count; index++) {
             close_device(&devices[index]);
         }
         if (keep_running) {
-            fprintf(stderr, "fn-remap: input device changed, retrying\n");
-            sleep_seconds(RETRY_DELAY_SECONDS);
+            fprintf(stderr, "fn-remap: input device changed, retrying in %u seconds\n",
+                    retry_delay);
+            sleep_seconds(retry_delay);
+            retry_delay = next_retry_delay(retry_delay);
         }
     }
     return 0;
