@@ -20,14 +20,68 @@
 #include <time.h>
 #include <unistd.h>
 
+// Both paths are overridable so tests/test_fn_remap_profiles.c can point them at
+// a temporary directory; the shipped build never defines them.
+#ifndef CONFIG_PATH
 #define CONFIG_PATH "/data/adb/modules/Gold_Keyboardremaps/config.conf"
+#endif
+// While this exists, the profile in it wins. Anland creates it on entering
+// immersive mode and removes it on the way out, so the switch needs no restart
+// and no intervention from the daemon's supervisor.
+#ifndef ANLAND_PROFILE_REQUEST
+#define ANLAND_PROFILE_REQUEST "/data/adb/modules/Gold_Keyboardremaps/anland-profile"
+#endif
+#define PROFILE_NAME_MAX 64
+// Rules written before any profile= line belong to this one, which is what
+// makes a config from an older build keep working untouched.
+#define DEFAULT_PROFILE_NAME "默认"
+#define ANLAND_PROFILE_NAME "Anland"
+// Overridable so tests/test_fn_remap_input_status.c can point it at a temporary
+// directory; the shipped build never defines it.
+#ifndef INPUT_STATUS_PATH
+#define INPUT_STATUS_PATH "/data/adb/modules/Gold_Keyboardremaps/input-status"
+#endif
+#define INPUT_STATUS_TMP INPUT_STATUS_PATH ".tmp"
+// Overridable the same way, for the same reason.
+#ifndef LATENCY_STATUS_PATH
+#define LATENCY_STATUS_PATH "/data/adb/modules/Gold_Keyboardremaps/latency-status"
+#endif
+#define LATENCY_STATUS_TMP LATENCY_STATUS_PATH ".tmp"
+// How many recent key transitions the published figures describe. A lifetime
+// average would be dominated by whatever happened in the first seconds and
+// would never move again; what the readout is for is what the keyboard is
+// doing now.
+#define LATENCY_WINDOW 64
+#define INPUT_STATUS_NODE_NAME 16
+// How often a running worker refreshes the snapshot. keyboardctl treats a
+// snapshot older than a few of these as abandoned.
+#define INPUT_STATUS_HEARTBEAT_SECONDS 1
 #define VIRTUAL_NAME_PREFIX "Gold Keyboardremaps"
 #define COLOROS_WINDOW_LAUNCHER "/data/adb/modules/Gold_Keyboardremaps/bin/coloros-window-launcher.jar"
 #define COLOROS_WINDOW_LAUNCHER_CLASS "gold.keyboardremaps.ColorOS"
 #define COLOROS_SCREENSHOT_LAUNCHER "/data/adb/modules/Gold_Keyboardremaps/bin/coloros-window-launcher.jar"
 #define COLOROS_SCREENSHOT_LAUNCHER_CLASS "gold.keyboardremaps.ColorOS"
-#define VIRTUAL_VENDOR 0x22d9
-#define VIRTUAL_PRODUCT 0x386a
+// Identity of the virtual keyboard Gold creates. 0xffff:0xffff is deliberately a
+// pair no real device should present: Android hands a device its key layout by
+// vendor and product, so an id borrowed from hardware that exists in the wild
+// would hand our layout to that hardware as well. The pair used to be
+// 0x22d9:0x386a -- the vendor of the tablet keyboards this was written for, one
+// product id above the physical keyboard's own -- which is exactly the collision
+// worth avoiding.
+//
+// Zero would not do instead: Android only takes the vendor/product branch when
+// both are non-zero, and falls back to Generic.kl otherwise.
+//
+// These two are an anchor, not a private detail. Two other places spell out the
+// same numbers, and nothing in the build compares them:
+//   * keylayout.sh derives its file name, Vendor_ffff_Product_ffff.kl, from
+//     them. Change only one side and Android resolves no layout of ours, so the
+//     Meta key silently goes back to being swallowed by ROMs that reserve it.
+//   * GoldUinputBusSession.java in the Anland consumer app matches this keyboard
+//     by the same ids. Change only one side and the app stops recognising it.
+// tests/test_device_identity.sh checks both against this file.
+#define VIRTUAL_VENDOR 0xffff
+#define VIRTUAL_PRODUCT 0xffff
 #define RETRY_DELAY_INITIAL_SECONDS 2
 #define RETRY_DELAY_MAX_SECONDS 30
 #define MAX_DEVICES 16
@@ -114,6 +168,8 @@ typedef struct {
 static volatile sig_atomic_t keep_running = 1;
 
 static void index_config_keys(Config *config);
+static int emit_key(DeviceContext *device, const struct input_event *original, int key, int value);
+static int flush_forwarded_events(DeviceContext *device);
 
 static const KeyName k_key_names[] = {
     {"KEY_ESC", KEY_ESC}, {"KEY_1", KEY_1}, {"KEY_2", KEY_2},
@@ -492,7 +548,72 @@ static bool parse_device_selector(Config *config, char *text) {
     return true;
 }
 
-static void load_config(Config *config) {
+/*
+ * The profile currently in force. Swapped in place when the request file
+ * appears or disappears, so a switch costs no re-grab and no gap in forwarding.
+ */
+static char g_active_profile[PROFILE_NAME_MAX];
+
+static const char *profile_from_request_file(void) {
+    return access(ANLAND_PROFILE_REQUEST, F_OK) == 0 ? ANLAND_PROFILE_NAME : NULL;
+}
+
+// Whether the config actually defines a section by this name.
+static bool config_has_profile(const char *profile) {
+    FILE *file = fopen(CONFIG_PATH, "r");
+    if (file == NULL) {
+        return false;
+    }
+    char line[1200];
+    bool found = false;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char *value = trim(line);
+        if (strncmp(value, "profile=", 8) != 0) {
+            continue;
+        }
+        if (strcmp(trim(value + 8), profile) == 0) {
+            found = true;
+            break;
+        }
+    }
+    fclose(file);
+    return found;
+}
+
+// Which profile should be in force: Anland's request first, then whatever the
+// config nominates, then the implicit default that older configs use.
+static void resolve_active_profile(char *out, size_t out_size) {
+    const char *requested = profile_from_request_file();
+    // Only honour the request if the profile exists. Switching to one that does
+    // not would empty the rule set and silently stop every mapping the user has
+    // -- the opposite of what asking for a profile is meant to do. Until the
+    // Anland section is written, its request leaves the current profile alone.
+    if (requested != NULL && config_has_profile(requested)) {
+        snprintf(out, out_size, "%s", requested);
+        return;
+    }
+
+    snprintf(out, out_size, "%s", DEFAULT_PROFILE_NAME);
+    FILE *file = fopen(CONFIG_PATH, "r");
+    if (file == NULL) {
+        return;
+    }
+    char line[1200];
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char *value = trim(line);
+        if (strncmp(value, "active_profile=", 15) != 0) {
+            continue;
+        }
+        char *name = trim(value + 15);
+        if (*name != '\0') {
+            snprintf(out, out_size, "%s", name);
+        }
+        break;
+    }
+    fclose(file);
+}
+
+static void load_config_profile(Config *config, const char *profile) {
     memset(config, 0, sizeof(*config));
     config->auto_select = true;
 
@@ -504,12 +625,22 @@ static void load_config(Config *config) {
     }
 
     config->auto_select = false;
+    char section[PROFILE_NAME_MAX];
+    snprintf(section, sizeof(section), "%s", DEFAULT_PROFILE_NAME);
+
     char line[1200];
     while (fgets(line, sizeof(line), file) != NULL) {
         char *value = trim(line);
         if (*value == '\0' || *value == '#') {
             continue;
         }
+        if (strncmp(value, "profile=", 8) == 0) {
+            snprintf(section, sizeof(section), "%s", trim(value + 8));
+            continue;
+        }
+        // Device selection is not part of a profile: which keyboard to take is a
+        // property of the machine, not of the mapping in force. It applies
+        // wherever it appears.
         if (strncmp(value, "device=", 7) == 0) {
             char *device = trim(value + 7);
             if (strcmp(device, "auto") == 0) {
@@ -517,7 +648,15 @@ static void load_config(Config *config) {
             } else {
                 (void)parse_device_selector(config, device);
             }
-        } else if (strncmp(value, "mapping=", 8) == 0) {
+            continue;
+        }
+        // Everything else is a rule, and belongs to the section it is under.
+        // A NULL profile asks for every section, which is how the union of all
+        // profiles' targets is collected for the key-bit declaration.
+        if (profile != NULL && strcmp(section, profile) != 0) {
+            continue;
+        }
+        if (strncmp(value, "mapping=", 8) == 0) {
             (void)add_mapping(config, trim(value + 8));
         } else if (strncmp(value, "launch=", 7) == 0) {
             (void)add_launch_rule(config, trim(value + 7));
@@ -533,6 +672,48 @@ static void load_config(Config *config) {
         config->auto_select = true;
     }
     index_config_keys(config);
+}
+
+static void load_config(Config *config) {
+    char profile[PROFILE_NAME_MAX];
+    resolve_active_profile(profile, sizeof(profile));
+    snprintf(g_active_profile, sizeof(g_active_profile), "%s", profile);
+    load_config_profile(config, profile);
+}
+
+// Whether the profile that should be in force is not the one loaded.
+static bool profile_switch_pending(void) {
+    char wanted[PROFILE_NAME_MAX];
+    resolve_active_profile(wanted, sizeof(wanted));
+    return strcmp(wanted, g_active_profile) != 0;
+}
+
+/*
+ * Let go of everything a device is holding.
+ *
+ * Called when the profile changes. A target key pressed under one profile has
+ * to be released under that same profile -- the one replacing it may have no
+ * rule that would ever release it, and the key would stay down on the desktop
+ * for good. Whatever the user is still holding physically simply stops being
+ * forwarded until they press it again: an interruption, not a stuck key.
+ */
+static void release_all_keys(DeviceContext *device) {
+    struct input_event release;
+    memset(&release, 0, sizeof(release));
+    release.type = EV_KEY;
+
+    for (int key = 0; key <= KEY_MAX; key++) {
+        if (device->target_refs[key] != 0) {
+            device->target_refs[key] = 0;
+            (void)emit_key(device, &release, key, 0);
+        }
+        device->pressed[key] = false;
+        device->pending[key] = false;
+        device->suppressed[key] = false;
+        device->forwarded[key] = false;
+    }
+    memset(device->active_rules, 0, sizeof(device->active_rules));
+    (void)flush_forwarded_events(device);
 }
 
 static bool is_virtual_name(const char *name) {
@@ -661,7 +842,71 @@ static bool source_is_transport_duplicate(const DeviceContext devices[MAX_DEVICE
     return false;
 }
 
+/*
+ * Per-event latency: the gap between the kernel stamping a physical event --
+ * which every forwarded event carries in .time -- and this daemon writing it
+ * back out. Both ends are read on the clock the kernel used, so the figure has
+ * no measuring tool inside it, which a shell-based measurement cannot avoid:
+ * there, sendevent's own process startup is tens of milliseconds and buries
+ * anything the daemon does.
+ *
+ * Deliberately cheap: two clock reads and an array slot per key transition, so
+ * it can stay on in normal use rather than being a special build.
+ */
+static struct {
+    unsigned int window[LATENCY_WINDOW];
+    size_t next;
+    size_t filled;
+    unsigned long long total;
+    unsigned int last_us;
+} g_latency;
+
+/*
+ * input_event.time is CLOCK_REALTIME, so this has to be read the same way --
+ * and in the same width. Realtime microseconds need 51 bits; narrowing either
+ * side to 32 makes the subtraction below come out negative, and the probe then
+ * discards every sample without saying anything.
+ */
+static unsigned long long latency_now_us(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        return 0;
+    }
+    return (unsigned long long)ts.tv_sec * 1000000ULL
+         + (unsigned long long)ts.tv_nsec / 1000ULL;
+}
+
+static void latency_note(const struct input_event *event) {
+    // One sample per key transition, not per event: a repeat carries the
+    // original press's timestamp and would drag the window backwards.
+    if (event->type != EV_KEY || event->value == 2) {
+        return;
+    }
+    unsigned long long stamped = (unsigned long long)event->time.tv_sec * 1000000ULL
+                               + (unsigned long long)event->time.tv_usec;
+    unsigned long long now = latency_now_us();
+    if (stamped == 0 || now == 0 || now < stamped) {
+        return;
+    }
+    unsigned long long delta = now - stamped;
+    // A gap this large is a clock that moved, not a key press this daemon was
+    // slow to handle; the window is microseconds and would be meaningless.
+    if (delta > 0xFFFFFFFFULL) {
+        return;
+    }
+    g_latency.window[g_latency.next] = (unsigned int)delta;
+    g_latency.next = (g_latency.next + 1) % LATENCY_WINDOW;
+    if (g_latency.filled < LATENCY_WINDOW) {
+        g_latency.filled++;
+    }
+    g_latency.total++;
+    g_latency.last_us = delta;
+}
+
 static int write_events(int fd, const struct input_event *events, size_t count) {
+    for (size_t index = 0; index < count; index++) {
+        latency_note(&events[index]);
+    }
     const uint8_t *data = (const uint8_t *)events;
     size_t remaining = count * sizeof(*events);
     while (remaining != 0) {
@@ -716,7 +961,40 @@ static bool is_mapping_target(const Config *config, int key) {
     return false;
 }
 
-static int create_virtual_keyboard(int source_fd, const Config *config, const char *source_path) {
+/*
+ * Declares a key bit for every key any profile in the config could emit.
+ *
+ * The mask has to cover every profile, not just the one loaded when the device
+ * is created. A profile switch keeps the same virtual device -- see the switch
+ * path, which only reloads the config -- and the input core drops EV_KEY events
+ * for codes a device never declared. Declaring only the active profile's targets
+ * therefore leaves the next profile's mappings silently doing nothing until
+ * Gold restarts.
+ *
+ * Declaring more than the active profile uses costs nothing: the device still
+ * emits only what the rules say.
+ */
+static int declare_mapping_targets(int fd) {
+    Config *all = calloc(1, sizeof(*all));
+    if (all == NULL) {
+        return -1;
+    }
+    // A NULL profile means "every section", so this collects the union.
+    load_config_profile(all, NULL);
+    int result = 0;
+    for (int key = 0; key <= KEY_MAX && result == 0; key++) {
+        if (!is_mapping_target(all, key)) {
+            continue;
+        }
+        if (ioctl(fd, UI_SET_KEYBIT, key) < 0) {
+            result = -1;
+        }
+    }
+    free(all);
+    return result;
+}
+
+static int create_virtual_keyboard(int source_fd, const char *source_path) {
     uint8_t key_bits[(KEY_MAX + 8) / 8] = {0};
     uint8_t led_bits[(LED_MAX + 8) / 8] = {0};
     if (ioctl(source_fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0) {
@@ -732,13 +1010,17 @@ static int create_virtual_keyboard(int source_fd, const Config *config, const ch
     }
 
     for (int key = 0; key <= KEY_MAX; key++) {
-        if (!bit_is_set(key_bits, (unsigned int)key) && !is_mapping_target(config, key)) {
+        if (!bit_is_set(key_bits, (unsigned int)key)) {
             continue;
         }
         if (ioctl(fd, UI_SET_KEYBIT, key) < 0) {
             close(fd);
             return -1;
         }
+    }
+    if (declare_mapping_targets(fd) < 0) {
+        close(fd);
+        return -1;
     }
     if (ioctl(source_fd, EVIOCGBIT(EV_LED, sizeof(led_bits)), led_bits) >= 0) {
         if (ioctl(fd, UI_SET_EVBIT, EV_LED) < 0) {
@@ -1089,7 +1371,15 @@ static int handle_key_event(DeviceContext *device, const Config *config,
     if (event->value == 1) {
         device->pressed[key] = true;
         if (!mapping_source) {
-            return forward_event(device, event);
+            // A transformed key has been re-labelled, and the release path
+            // below emits nothing for it -- it assumes the press emitted
+            // nothing either. Passing the raw event through here instead
+            // publishes a key code that nothing will ever release: it is not a
+            // rule source, so no rule lifts it, and its own release is dropped.
+            // Emitting the canonical key keeps what goes out and what comes
+            // back the same key. Untransformed keys are unaffected.
+            return transformed_key ? emit_key(device, event, key, 1)
+                                   : forward_event(device, event);
         }
         int rule = matching_rule(config, device, key);
         if (rule >= 0) {
@@ -1162,10 +1452,14 @@ static int handle_key_event(DeviceContext *device, const Config *config,
             }
         }
         device->forwarded[key] = false;
-        return transformed_key ? 0 : forward_event(device, event);
+        // The matching half of the press above: a transformed key leaves as the
+        // canonical key it was re-labelled to, not as nothing.
+        return transformed_key ? emit_key(device, event, key, 0)
+                               : forward_event(device, event);
     }
 
-    return transformed_key ? 0 : forward_event(device, event);
+    return transformed_key ? emit_key(device, event, key, 0)
+                           : forward_event(device, event);
 }
 
 static bool is_direct_passthrough_event(const struct input_event *event, const Config *config) {
@@ -1276,7 +1570,7 @@ static void close_device(DeviceContext *device) {
 
 static bool add_device(DeviceContext devices[MAX_DEVICES], size_t *count, int source_fd,
                        const char *source_path, const char *source_name,
-                       const struct input_id *source_id, const Config *config,
+                       const struct input_id *source_id,
                        bool skip_companion_transport) {
     bool companion_transport =
         skip_companion_transport &&
@@ -1294,7 +1588,7 @@ static bool add_device(DeviceContext devices[MAX_DEVICES], size_t *count, int so
     snprintf(device.source_path, sizeof(device.source_path), "%s", source_path);
     snprintf(device.source_name, sizeof(device.source_name), "%s", source_name);
     device.source_id = *source_id;
-    device.virtual_fd = create_virtual_keyboard(source_fd, config, source_path);
+    device.virtual_fd = create_virtual_keyboard(source_fd, source_path);
     if (device.virtual_fd < 0) {
         fprintf(stderr, "fn-remap: cannot create virtual keyboard for %s: %s\n", source_path,
                 strerror(errno));
@@ -1318,7 +1612,7 @@ static void find_selected_devices(DeviceContext devices[MAX_DEVICES], size_t *co
         struct input_id id;
         int fd = open_source(selector->path, name, sizeof(name), &id);
         if (fd >= 0 && matches_selector(&id, selector)) {
-            (void)add_device(devices, count, fd, selector->path, name, &id, config, false);
+            (void)add_device(devices, count, fd, selector->path, name, &id, false);
             continue;
         }
         if (fd >= 0) {
@@ -1336,16 +1630,68 @@ static void find_selected_devices(DeviceContext devices[MAX_DEVICES], size_t *co
                 close(fd);
                 continue;
             }
-            (void)add_device(devices, count, fd, path, name, &id, config, false);
+            (void)add_device(devices, count, fd, path, name, &id, false);
             break;
         }
     }
 }
 
-static void find_default_device(DeviceContext devices[MAX_DEVICES], size_t *count,
-                                const Config *config) {
-    for (int event_number = 0; event_number < EVENT_SCAN_LIMIT && *count < MAX_DEVICES;
-         event_number++) {
+/*
+ * Auto-selection scans twice.
+ *
+ * A keyboard that is offered over both a wired transport and Bluetooth exposes
+ * two nodes with the same vendor, product and name. Picking whichever has the
+ * lower event number is a coin toss decided by how the kernel happened to number
+ * them this boot -- and this daemon's own virtual keyboard shifts those numbers
+ * around, so the same tablet can pick a different node after a replug.
+ *
+ * The physically attached transport wins the first pass: a keyboard sitting on
+ * the dock is the one whose keys are being pressed, and it is the transport that
+ * does not depend on a radio link staying up. The second pass keeps working for
+ * keyboards that are only offered over Bluetooth.
+ */
+static void find_default_device(DeviceContext devices[MAX_DEVICES], size_t *count) {
+    for (int pass = 0; pass < 2 && *count == 0; pass++) {
+        bool physical_only = (pass == 0);
+        for (int event_number = 0;
+             event_number < EVENT_SCAN_LIMIT && *count < MAX_DEVICES; event_number++) {
+            char path[64];
+            char name[128];
+            struct input_id id;
+            snprintf(path, sizeof(path), "/dev/input/event%d", event_number);
+            int fd = open_source(path, name, sizeof(name), &id);
+            if (fd < 0) {
+                continue;
+            }
+            if (physical_only && id.bustype == BUS_BLUETOOTH) {
+                close(fd);
+                continue;
+            }
+            if (!is_auto_keyboard(fd, name)) {
+                close(fd);
+                continue;
+            }
+            (void)add_device(devices, count, fd, path, name, &id, true);
+        }
+    }
+}
+
+/*
+ * Every node auto-selection would consider a keyboard, whether or not this
+ * daemon ends up grabbing it.
+ *
+ * A keyboard offered over two transports can be taken by either, and which one
+ * is held can change across a replug. Anything that needs to stay out of this
+ * daemon's way therefore has to know the whole family, not just the node that
+ * happens to be held at this instant -- "Gold is not holding it right now" is
+ * not the same as "it is free".
+ */
+static char g_claimed[EVENT_SCAN_LIMIT][16];
+static size_t g_claimed_count;
+
+static void find_claimed_keyboards(void) {
+    g_claimed_count = 0;
+    for (int event_number = 0; event_number < EVENT_SCAN_LIMIT; event_number++) {
         char path[64];
         char name[128];
         struct input_id id;
@@ -1354,11 +1700,13 @@ static void find_default_device(DeviceContext devices[MAX_DEVICES], size_t *coun
         if (fd < 0) {
             continue;
         }
-        if (!is_auto_keyboard(fd, name)) {
-            close(fd);
+        bool keyboard = is_auto_keyboard(fd, name);
+        close(fd);
+        if (!keyboard || g_claimed_count >= EVENT_SCAN_LIMIT) {
             continue;
         }
-        (void)add_device(devices, count, fd, path, name, &id, config, true);
+        snprintf(g_claimed[g_claimed_count], sizeof(g_claimed[0]), "event%d", event_number);
+        g_claimed_count++;
     }
 }
 
@@ -1462,10 +1810,339 @@ capture_done:
     return 0;
 }
 
-static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, const Config *config,
+// ---- authoritative input occupancy snapshot ------------------------------
+//
+// Anland needs to know which physical nodes Gold holds right now, because those
+// are the ones it must keep its hands off. The only honest source for that is
+// this process: it is the thing that called EVIOCGRAB. So the daemon publishes
+// what it actually holds, and keyboardctl refuses to answer when that
+// publication is missing, stale or malformed. An unreadable Gold is not an idle
+// Gold — the reader is told "unknown" rather than "nothing is taken".
+//
+// The file is replaced via a temp file and rename(), so a reader never sees a
+// half-written line. Its mtime is the heartbeat: every poll tick refreshes it,
+// so a snapshot whose mtime has stopped moving comes from a process that is no
+// longer running, and is treated as unknown rather than believed.
+
+static char g_status_instance[33];
+static char g_status_boot_id[128];
+static unsigned long long g_status_generation;
+static struct timespec g_status_last_publish;
+static bool g_status_has_published;
+
+// The heartbeat is driven by elapsed time, never by "nothing happened". A busy
+// keyboard keeps poll() returning events forever, and a retry backoff can sleep
+// for thirty seconds; keying the refresh off either one would let a perfectly
+// healthy daemon look dead exactly when it is working hardest.
+static bool status_heartbeat_due(void) {
+    if (!g_status_has_published) {
+        return true;
+    }
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return true;
+    }
+    time_t elapsed = now.tv_sec - g_status_last_publish.tv_sec;
+    return elapsed >= INPUT_STATUS_HEARTBEAT_SECONDS;
+}
+
+static void status_read_boot_id(void) {
+    g_status_boot_id[0] = '\0';
+    FILE *file = fopen("/proc/sys/kernel/random/boot_id", "r");
+    if (file != NULL) {
+        if (fgets(g_status_boot_id, sizeof(g_status_boot_id), file) == NULL) {
+            g_status_boot_id[0] = '\0';
+        }
+        fclose(file);
+    }
+    size_t length = strlen(g_status_boot_id);
+    while (length > 0 &&
+           (g_status_boot_id[length - 1] == '\n' || g_status_boot_id[length - 1] == '\r')) {
+        g_status_boot_id[--length] = '\0';
+    }
+    if (length == 0) {
+        snprintf(g_status_boot_id, sizeof(g_status_boot_id), "unknown");
+    }
+}
+
+// One identity per worker process. The generation counter alone cannot tell two
+// workers apart, because it starts over every time this process does.
+static void status_init_identity(void) {
+    status_read_boot_id();
+
+    unsigned char raw[16];
+    bool seeded = false;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t got = read(fd, raw, sizeof(raw));
+        seeded = (got == (ssize_t)sizeof(raw));
+        close(fd);
+    }
+    if (!seeded) {
+        // Uniqueness only has to hold across restarts of one module, so pid and
+        // clock are enough when urandom is somehow unavailable.
+        struct timespec now;
+        (void)clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t mix = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+        mix ^= (uint64_t)(unsigned int)getpid() << 32;
+        memset(raw, 0, sizeof(raw));
+        memcpy(raw, &mix, sizeof(mix));
+    }
+
+    static const char digits[] = "0123456789abcdef";
+    for (size_t index = 0; index < sizeof(raw); index++) {
+        g_status_instance[index * 2] = digits[raw[index] >> 4];
+        g_status_instance[index * 2 + 1] = digits[raw[index] & 0x0f];
+    }
+    g_status_instance[sizeof(raw) * 2] = '\0';
+}
+
+// A worker may publish when the snapshot is absent or already its own. A
+// snapshot belonging to a different worker is that worker's claim: a worker on
+// its way out must not clear it, and a stale one must not overwrite it.
+static bool status_publish_allowed(void) {
+    FILE *file = fopen(INPUT_STATUS_PATH, "r");
+    if (file == NULL) {
+        return true;
+    }
+    char line[512];
+    // Claimable unless the file positively identifies a different worker. A
+    // truncated or empty file must not wedge a worker into never publishing.
+    bool ours = true;
+    if (fgets(line, sizeof(line), file) != NULL) {
+        const char *field = strstr(line, "\tinstance=");
+        if (field != NULL) {
+            field += strlen("\tinstance=");
+            const char *end = strchr(field, '\t');
+            size_t length = (end == NULL) ? strlen(field) : (size_t)(end - field);
+            ours = (length == strlen(g_status_instance)) &&
+                   memcmp(field, g_status_instance, length) == 0;
+        }
+    }
+    fclose(file);
+    return ours;
+}
+
+static int status_compare_nodes(const void *left, const void *right) {
+    return strcmp((const char *)left, (const char *)right);
+}
+
+// "/dev/input/event9" -> "event9". The node name, not the fd, is what Anland
+// can act on.
+static bool status_node_name(const DeviceContext *device, char *out, size_t out_size) {
+    const char *base = strrchr(device->source_path, '/');
+    base = (base == NULL) ? device->source_path : base + 1;
+    size_t length = strlen(base);
+    if (length == 0 || length >= out_size) {
+        return false;
+    }
+    memcpy(out, base, length + 1);
+    return true;
+}
+
+// Publishes the set this process currently holds under EVIOCGRAB. A device only
+// reaches `devices` after its grab succeeded, and a closed device is skipped
+// here, so the file can never claim a node this process does not hold.
+static void status_publish(const DeviceContext *devices, size_t count) {
+
+    char names[MAX_DEVICES][INPUT_STATUS_NODE_NAME];
+    size_t node_count = 0;
+    for (size_t index = 0; index < count && index < MAX_DEVICES; index++) {
+        if (devices[index].source_fd < 0) {
+            continue;
+        }
+        if (status_node_name(&devices[index], names[node_count], sizeof(names[0]))) {
+            node_count++;
+        }
+    }
+    qsort(names, node_count, sizeof(names[0]), status_compare_nodes);
+
+    char nodes[INPUT_STATUS_NODE_NAME * MAX_DEVICES + MAX_DEVICES];
+    size_t written = 0;
+    if (node_count == 0) {
+        // Verified empty is spelled as a dash; the reader rejects an empty list
+        // spelled any other way.
+        memcpy(nodes, "-", 1);
+        written = 1;
+    } else {
+        for (size_t index = 0; index < node_count; index++) {
+            int added = snprintf(nodes + written, sizeof(nodes) - written, "%s%s",
+                                 index == 0 ? "" : ",", names[index]);
+            if (added < 0 || (size_t)added >= sizeof(nodes) - written) {
+                return;  // Cannot describe the truth, so publish nothing at all.
+            }
+            written += (size_t)added;
+        }
+    }
+    nodes[written] = '\0';
+
+    // The keyboards this daemon is responsible for, held or not. A reader that
+    // only avoided the held ones would take the other transport of the same
+    // keyboard the moment this daemon let go of it.
+    char claimed[INPUT_STATUS_NODE_NAME * EVENT_SCAN_LIMIT];
+    size_t claimed_written = 0;
+    if (g_claimed_count == 0) {
+        memcpy(claimed, "-", 1);
+        claimed_written = 1;
+    } else {
+        char sorted[EVENT_SCAN_LIMIT][INPUT_STATUS_NODE_NAME];
+        memcpy(sorted, g_claimed, sizeof(sorted));
+        qsort(sorted, g_claimed_count, sizeof(sorted[0]), status_compare_nodes);
+        for (size_t index = 0; index < g_claimed_count; index++) {
+            int added = snprintf(claimed + claimed_written, sizeof(claimed) - claimed_written,
+                                 "%s%s", index == 0 ? "" : ",", sorted[index]);
+            if (added < 0 || (size_t)added >= sizeof(claimed) - claimed_written) {
+                return;
+            }
+            claimed_written += (size_t)added;
+        }
+    }
+    claimed[claimed_written] = '\0';
+
+    g_status_generation++;
+
+    char line[2048];
+    int length = snprintf(line, sizeof(line),
+                          "GOLDCTL1\tinput-status\tok\tcode=ready\tboot_id=%s"
+                          "\tgeneration=%llu\tinstance=%s\tcount=%zu\tnodes=%s\tclaimed=%s\n",
+                          g_status_boot_id, g_status_generation, g_status_instance, node_count,
+                          nodes, claimed);
+    if (length < 0 || (size_t)length >= sizeof(line)) {
+        return;
+    }
+
+    int fd = open(INPUT_STATUS_TMP, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return;
+    }
+    ssize_t done = write(fd, line, (size_t)length);
+    if (done != (ssize_t)length) {
+        close(fd);
+        (void)unlink(INPUT_STATUS_TMP);
+        return;
+    }
+    (void)fsync(fd);
+    close(fd);
+    // rename() is the publication: a reader sees the old line or the new one.
+    if (rename(INPUT_STATUS_TMP, INPUT_STATUS_PATH) != 0) {
+        (void)unlink(INPUT_STATUS_TMP);
+        return;
+    }
+    g_status_has_published = true;
+    (void)clock_gettime(CLOCK_MONOTONIC, &g_status_last_publish);
+}
+
+// The departing worker's final word. This is the one publication that races
+// with a successor, so it is the one that checks ownership first: a snapshot
+// belonging to a different worker is that worker's claim, and clearing it on
+// the way out would erase a live claim with a dead one. Normal publishing is
+// unconditional on purpose — a worker that is running is the current truth,
+// and gating it on ownership would let a leftover file silence its successor
+// forever.
+static void status_release(const DeviceContext *devices, size_t count) {
+    if (status_publish_allowed()) {
+        status_publish(devices, count);
+    }
+}
+
+// Refreshes only when the heartbeat is due, so callers can run this every loop
+// iteration without writing on every keystroke.
+/*
+ * Publishes what the latency window currently says, in the same snapshot
+ * grammar the device status uses and written the same way -- temp file, then
+ * rename -- so a reader sees one whole line or the previous one.
+ *
+ * Units are microseconds. A caller wanting milliseconds should divide rather
+ * than have this round: the interesting end of the range is tens of
+ * microseconds, and rounding here would throw most of it away.
+ */
+static void latency_publish(void) {
+    unsigned int lowest = 0;
+    unsigned int highest = 0;
+    unsigned long long sum = 0;
+    size_t count = g_latency.filled;
+    for (size_t index = 0; index < count; index++) {
+        unsigned int sample = g_latency.window[index];
+        if (index == 0 || sample < lowest) {
+            lowest = sample;
+        }
+        if (index == 0 || sample > highest) {
+            highest = sample;
+        }
+        sum += sample;
+    }
+
+    char line[320];
+    int length = snprintf(line, sizeof(line),
+                          "GOLDCTL1\tlatency\tok\tcode=ready\tboot_id=%s\tinstance=%s"
+                          "\tcount=%llu\twindow=%zu\tlast_us=%u\tmin_us=%u"
+                          "\tavg_us=%llu\tmax_us=%u\n",
+                          g_status_boot_id, g_status_instance, g_latency.total, count,
+                          g_latency.last_us, lowest,
+                          count == 0 ? 0ULL : sum / count, highest);
+    if (length < 0 || (size_t)length >= sizeof(line)) {
+        return;
+    }
+
+    int fd = open(LATENCY_STATUS_TMP, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return;
+    }
+    ssize_t done = write(fd, line, (size_t)length);
+    if (done != (ssize_t)length) {
+        close(fd);
+        (void)unlink(LATENCY_STATUS_TMP);
+        return;
+    }
+    (void)fsync(fd);
+    close(fd);
+    if (rename(LATENCY_STATUS_TMP, LATENCY_STATUS_PATH) != 0) {
+        (void)unlink(LATENCY_STATUS_TMP);
+    }
+}
+
+static void status_heartbeat(const DeviceContext *devices, size_t count) {
+    if (status_heartbeat_due()) {
+        status_publish(devices, count);
+        // Same tick, same cadence: whoever reads one is reading a picture of
+        // the same second.
+        latency_publish();
+    }
+}
+
+// Waits while keeping the heartbeat alive. The daemon is still running and still
+// holds exactly this set, and the snapshot has to keep saying so.
+static void status_sleep(unsigned int seconds, const DeviceContext *devices, size_t count) {
+    for (unsigned int elapsed = 0; elapsed < seconds && keep_running; elapsed++) {
+        status_heartbeat(devices, count);
+        sleep_seconds(1);
+    }
+}
+
+static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Config *config,
                            unsigned int *retry_delay) {
     struct pollfd fds[MAX_DEVICES * 2];
     while (keep_running) {
+        // Driven by elapsed time, never by "poll timed out": a keyboard that is
+        // being typed on keeps poll() returning events forever, and the snapshot
+        // still has to be refreshed every second or the reader would conclude
+        // this process had died exactly when it was working hardest.
+        if (status_heartbeat_due()) {
+            status_heartbeat(devices, count);
+            // Same tick, same reason: the request file has to be noticed within
+            // about a second, and the devices stay grabbed while the rules are
+            // swapped underneath them.
+            if (profile_switch_pending()) {
+                for (size_t index = 0; index < count; index++) {
+                    release_all_keys(&devices[index]);
+                }
+                char profile[PROFILE_NAME_MAX];
+                resolve_active_profile(profile, sizeof(profile));
+                load_config_profile(config, profile);
+                snprintf(g_active_profile, sizeof(g_active_profile), "%s", profile);
+                fprintf(stderr, "fn-remap: profile switched to '%s'\n", profile);
+            }
+        }
         nfds_t fd_count = 0;
         for (size_t index = 0; index < count; index++) {
             fds[fd_count++] = (struct pollfd){.fd = devices[index].source_fd, .events = POLLIN};
@@ -1513,6 +2190,7 @@ int main(int argc, char **argv) {
     signal(SIGHUP, stop);
     signal(SIGCHLD, SIG_IGN);
     improve_scheduling_latency();
+    status_init_identity();
 
     if (argc >= 2 && strcmp(argv[1], "--capture") == 0) {
         unsigned long seconds = 5;
@@ -1537,6 +2215,9 @@ int main(int argc, char **argv) {
 
     unsigned int retry_delay = RETRY_DELAY_INITIAL_SECONDS;
     while (keep_running) {
+        // Before anything is grabbed: this is what the snapshot claims, so it
+        // has to reflect the devices present now, not the ones from last cycle.
+        find_claimed_keyboards();
         Config config;
         load_config(&config);
         DeviceContext devices[MAX_DEVICES];
@@ -1551,28 +2232,40 @@ int main(int argc, char **argv) {
             find_selected_devices(devices, &count, &config);
         }
         if (count == 0 && config.auto_select) {
-            find_default_device(devices, &count, &config);
+            find_default_device(devices, &count);
         }
         if (count == 0) {
             fprintf(stderr, "fn-remap: no selected keyboard is available; retrying in %u seconds\n",
                     retry_delay);
-            sleep_seconds(retry_delay);
+            // Alive and holding nothing. Saying so is what separates "verified
+            // empty" from "no snapshot at all" for the reader, and waiting
+            // through the retry keeps the heartbeat going so a healthy daemon
+            // does not age into "unknown" while it is simply between devices.
+            status_sleep(retry_delay, devices, 0);
             retry_delay = next_retry_delay(retry_delay);
             continue;
         }
 
         fprintf(stderr, "fn-remap: active on %zu keyboard(s), %zu rule(s)\n", count,
                 config.rule_count);
+        status_publish(devices, count);
         (void)forward_devices(devices, count, &config, &retry_delay);
         for (size_t index = 0; index < count; index++) {
             close_device(&devices[index]);
         }
+        // The grabs are gone. Say so now, rather than leaving the previous claim
+        // standing through the retry sleep.
+        status_release(devices, 0);
         if (keep_running) {
             fprintf(stderr, "fn-remap: input device changed, retrying in %u seconds\n",
                     retry_delay);
-            sleep_seconds(retry_delay);
+            status_sleep(retry_delay, devices, 0);
             retry_delay = next_retry_delay(retry_delay);
         }
     }
+    // Shutting down cleanly: every grab is already released, so publish the
+    // empty set with a fresh timestamp instead of leaving a stale claim behind
+    // for the reader to age out.
+    status_release(NULL, 0);
     return 0;
 }

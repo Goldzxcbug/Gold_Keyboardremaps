@@ -150,6 +150,14 @@ main { width: min(980px, 100%); margin: 0 auto; padding: 20px; }
 .switch-line input:checked + .switch { background: var(--accent); }
 .switch-line input:checked + .switch::after { transform: translateX(14px); }
 .muted { color: var(--muted); }
+.latency-hint { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+.latency-content { display: grid; gap: 12px; }
+.latency-readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 8px; font-variant-numeric: tabular-nums; }
+.latency-figure { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-alt); }
+.latency-figure strong { font-size: 18px; color: var(--text); }
+.latency-figure small { font-size: 11px; color: var(--muted); }
+.latency-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
 .device-list, .mapping-list { display: grid; gap: 8px; }
 .device-row, .mapping-row { display: flex; align-items: center; gap: 12px; min-height: 58px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .device-row:hover, .mapping-row:hover { border-color: var(--line-strong); }
@@ -274,4 +282,28 @@ body.modal-open { overflow: hidden; }
   .footer-bar .button { flex: 0 0 auto; }
   .keyboard-dialog { padding: 10px; }
   .keyboard-dialog-card { padding: 15px; }
+}
+
+/* Mapping profiles: a plain row above the rule list, sized like the other
+   inline controls on the panel. */
+.profile-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.6rem;
+}
+
+.profile-row label {
+  font-size: 0.9rem;
+  opacity: 0.75;
+}
+
+.profile-row select {
+  min-width: 9rem;
+}
+
+.profile-note {
+  font-size: 0.82rem;
+  opacity: 0.7;
 }

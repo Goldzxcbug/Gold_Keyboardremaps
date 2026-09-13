@@ -54,6 +54,29 @@ jobs:
         with:
           packages: platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018
 
+      # The consumer app lives in another repository and the identity check
+      # compares fn_remap.c against it. Without this the check reports SKIP --
+      # it does not quietly pass -- so a run that never had a token is visibly
+      # not the same as a run that verified anything.
+      - name: Check out the Anland consumer app
+        if: ${{ vars.ANLAND_REPO != '' }}
+        continue-on-error: true
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ vars.ANLAND_REPO }}
+          token: ${{ secrets.ANLAND_TOKEN }}
+          path: anland
+
+      - name: Run host tests
+        run: |
+          set -eu
+          status=0
+          for t in tests/test_*.sh; do
+            echo "== $t"
+            sh "$t" || status=1
+          done
+          exit $status
+
       - name: Build module
         id: package
         env:

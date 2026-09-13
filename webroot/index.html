@@ -41,6 +41,23 @@
       <div id="deviceList" class="device-list" aria-live="polite"></div>
     </section>
 
+    <section class="panel" aria-labelledby="latencyTitle">
+      <div class="section-head">
+        <div>
+          <p class="section-kicker">性能</p>
+          <h2 id="latencyTitle">延迟测试</h2>
+        </div>
+      </div>
+      <p class="latency-hint">按键从内核记录到被转发出去用了多久。由 Gold 自己在内核的时钟上取样，所以这个数字里没有测量工具本身的开销。</p>
+      <div id="latencyContent" class="latency-content">
+        <div id="latencyReadout" class="latency-readout" role="status" aria-live="polite">尚未读取</div>
+        <div class="latency-actions">
+          <button id="measureLatency" class="button secondary" type="button">读取当前延迟</button>
+          <span id="latencyNote" class="muted"></span>
+        </div>
+      </div>
+    </section>
+
     <section id="mappingPanel" class="panel mapping-panel" aria-labelledby="mappingTitle">
       <div class="section-head mapping-head">
         <div>
@@ -54,6 +71,11 @@
       </div>
       <div id="mappingContent" class="mapping-content">
         <div id="mappingRulesPanel" class="mapping-rules-panel">
+          <div class="profile-row">
+            <label for="profileSelect">方案</label>
+            <select id="profileSelect" aria-label="按键映射方案"></select>
+            <span id="profileNote" class="profile-note"></span>
+          </div>
           <p id="fnHint" class="mapping-hint" role="status"></p>
           <div id="mappingList" class="mapping-list"></div>
           <div id="emptyMappings" class="empty-state" hidden>暂无映射规则</div>

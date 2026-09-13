@@ -40,6 +40,7 @@ Gold_Keyboardremaps/
 ├── service.sh
 ├── action.sh
 ├── config.conf
+├── input-status                      # 运行时生成，见下
 ├── bin/
 │   ├── fn-remap
 │   ├── keyboardctl
@@ -49,6 +50,9 @@ Gold_Keyboardremaps/
     ├── app.js
     └── style.css
 ```
+
+`input-status` 由 `fn-remap` 在运行时写入（原子替换），不需要打包，也不应手动编辑。
+它记录转发器当前实际独占（`EVIOCGRAB`）的物理节点，供 Anland 判断哪些节点不能碰。
 
 `fn_remap.c` 需要使用 Android 目标架构编译为 `bin/fn-remap`。如果要启用 ColorOS 小窗或系统截屏，需要使用 Android SDK 的 `android.jar` 编译 `ColorOS.java`，并把生成的类打包为 `bin/coloros-window-launcher.jar`。
 
@@ -133,10 +137,12 @@ Ctrl + Shift + Z    -> QQ 小窗（示例）
 ```ini
 version=1
 
-# 自动选择键盘
+# 自动选择键盘。同一块键盘同时以两种传输方式出现时（例如触点底座 + 蓝牙），
+# 优先选择蓝牙，因为那通常是用户在系统设置里主动配对的那一路。
 device=auto
 
 # 手动选择，格式为：设备路径|总线|厂商|产品
+# 总线取值见 linux/input.h：0003=USB，0005=蓝牙，0019=内置/触点
 device=/dev/input/event9|0019|22d9|3869
 
 # 按键映射
@@ -166,6 +172,32 @@ Shell 规则同样在组合中的最后一个键按下时执行。`shell` 模式
 ```sh
 su -c '/system/bin/sh /data/adb/modules/Gold_Keyboardremaps/bin/keyboardctl restart'
 ```
+
+### 查询当前独占的输入节点
+
+```sh
+su -c '/system/bin/sh /data/adb/modules/Gold_Keyboardremaps/bin/keyboardctl input-status'
+```
+
+成功时输出一行规范结果，例如：
+
+```text
+GOLDCTL1	input-status	ok	code=ready	boot_id=<启动 ID>	generation=<n>	instance=<token>	count=2	nodes=event12,event3
+```
+
+没有任何节点被独占时，`count=0` 且 `nodes=-`。节点按字典序排列（因此
+`event12` 排在 `event3` 之前），`event01` 这类带前导零的名字不会出现。
+
+这个命令是**纯读取**：不领取租约、不发送信号、不执行探测、不改变任何状态。
+转发器成功独占的节点不会因为有人查询而释放。
+
+无法给出可信答案时，程序输出规范错误行并以非零状态退出，例如
+`code=stale`（快照心跳已停止，说明写入它的进程已经不在了）或
+`code=no-snapshot`（还没有任何快照）。调用方必须把这种情况当作“未知”，
+而不是“没有占用”——读不到的 Gold 不等于空闲的 Gold。
+
+> 转发器默认只会在**关机**（`pkill` / 关闭模块）时停止刷新该文件，此时快照会过期，
+> 查询返回 `code=stale`。这是刻意的：过期状态不能被伪装成“未占用”。
 
 ## 故障排查
 

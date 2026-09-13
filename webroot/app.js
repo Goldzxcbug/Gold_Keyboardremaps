@@ -3,6 +3,16 @@ const CONFIG_PATH = `${MODDIR}/config.conf`;
 const CONTROL = `/system/bin/sh '${MODDIR}/bin/keyboardctl'`;
 const THEME_KEY = "gold_keyboardremaps_theme";
 
+// Mapping profiles. A config from before profiles existed has no sections at
+// all; its rules are the user's real mapping, so they are read into 方案一
+// rather than an invisible default nobody can pick.
+const MIGRATED_PROFILE = "方案一";
+const FIXED_PROFILES = ["方案一", "方案二", "方案三"];
+const ANLAND_PROFILE = "Anland";
+// Rules that appear before the first profile= line keep this name, which is
+// what the daemon calls the implicit section.
+const DEFAULT_PROFILE = "默认";
+
 const KEYS = [
   ["KEY_F23", "F23（厂商功能键）"],
   ["KEY_FN", "Fn"],
@@ -120,7 +130,13 @@ const state = {
   devices: [],
   apps: [],
   selected: new Set(),
+  // Always the rule array of the profile in activeProfile. Every other part of
+  // this file edits state.rules, so switching profiles is just a change of
+  // which array that name points at -- there is no second code path to keep in
+  // step with the first.
   rules: [],
+  profiles: [],
+  activeProfile: MIGRATED_PROFILE,
   editor: null,
   mappingUi: {
     expanded: false,
@@ -128,6 +144,38 @@ const state = {
     draft: null,
   },
 };
+
+function cloneRule(rule) {
+  return {
+    ...rule,
+    source: [...rule.source],
+    target: rule.target ? [...rule.target] : rule.target,
+  };
+}
+
+function profileNamed(name) {
+  let profile = state.profiles.find((entry) => entry.name === name);
+  if (!profile) {
+    profile = { name, rules: [] };
+    state.profiles.push(profile);
+  }
+  return profile;
+}
+
+/** Makes `name` the profile the mapping list shows and edits. */
+function useProfile(name) {
+  const profile = profileNamed(name);
+  state.activeProfile = profile.name;
+  state.rules = profile.rules;
+  return profile;
+}
+
+/** Replaces the active profile's rules, keeping state.rules pointing at them. */
+function replaceActiveRules(rules) {
+  const profile = profileNamed(state.activeProfile);
+  profile.rules = rules;
+  state.rules = profile.rules;
+}
 
 let captureTimer = null;
 
@@ -266,10 +314,32 @@ function exec(command) {
 function parseConfig(text) {
   state.auto = false;
   state.selected.clear();
-  state.rules = [];
+  state.profiles = [];
+
+  // Rules are collected per section while reading, then handed to the state at
+  // the end: the config may name its active profile before, after, or in the
+  // middle of the sections it applies to.
+  const sections = new Map();
+  let loose = [];
+  let current = null;
+  let activeName = null;
+
+  const ruleSink = () => (current === null ? loose : current);
+
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
+    if (line.startsWith("profile=")) {
+      const name = line.slice(8).trim();
+      if (!name) continue;
+      if (!sections.has(name)) sections.set(name, []);
+      current = sections.get(name);
+      continue;
+    }
+    if (line.startsWith("active_profile=")) {
+      activeName = line.slice(15).trim() || null;
+      continue;
+    }
     if (line === "device=auto") {
       state.auto = true;
       continue;
@@ -281,7 +351,7 @@ function parseConfig(text) {
     if (line.startsWith("mapping=")) {
       const [source, target] = line.slice(8).split("=>");
       if (!source || !target) continue;
-      state.rules.push({ type: "keys", source: source.split("+").filter(Boolean), target: target.split("+").filter(Boolean) });
+      ruleSink().push({ type: "keys", source: source.split("+").filter(Boolean), target: target.split("+").filter(Boolean) });
       continue;
     }
     if (line.startsWith("launch=")) {
@@ -289,7 +359,7 @@ function parseConfig(text) {
       if (!source || !destination) continue;
       const [component, mode = "normal", repeatMode = ""] = destination.split("|");
       if (!component || (mode !== "normal" && mode !== "freeform") || (repeatMode && repeatMode !== "toggle")) continue;
-      state.rules.push({ type: "app", source: source.split("+").filter(Boolean), component, freeform: mode === "freeform", closeOnRepeat: repeatMode === "toggle" });
+      ruleSink().push({ type: "app", source: source.split("+").filter(Boolean), component, freeform: mode === "freeform", closeOnRepeat: repeatMode === "toggle" });
       continue;
     }
     if (line.startsWith("shell=")) {
@@ -307,15 +377,43 @@ function parseConfig(text) {
         }
       }
       if (!command.trim() || (mode !== "shell" && mode !== "root")) continue;
-      state.rules.push({ type: "shell", source: source.split("+").filter(Boolean), shellCommand: command, shellRunAsRoot: mode === "root" });
+      ruleSink().push({ type: "shell", source: source.split("+").filter(Boolean), shellCommand: command, shellRunAsRoot: mode === "root" });
       continue;
     }
     if (line.startsWith("screenshot=")) {
       const [source, mode] = line.slice(11).split("=>");
       if (!source || !["normal", "long", "area"].includes(mode)) continue;
-      state.rules.push({ type: "screenshot", source: source.split("+").filter(Boolean), screenshotMode: mode });
+      ruleSink().push({ type: "screenshot", source: source.split("+").filter(Boolean), screenshotMode: mode });
     }
   }
+
+  // A config written before profiles existed has no sections at all. Those
+  // rules are the user's real mapping, so they become 方案一 -- leaving them in
+  // an unnamed section would hide them behind a profile nobody could select.
+  if (sections.size === 0) {
+    sections.set(MIGRATED_PROFILE, loose);
+    loose = [];
+    activeName = activeName || MIGRATED_PROFILE;
+  } else if (loose.length) {
+    sections.set(DEFAULT_PROFILE, loose);
+  }
+
+  FIXED_PROFILES.forEach((name) => {
+    if (!sections.has(name)) sections.set(name, []);
+  });
+
+  // The Anland profile starts as a copy of 方案一: "keep my normal mapping and
+  // change a few keys while immersive" is what it is for, and an empty one
+  // would silently stop every mapping the moment immersive mode starts.
+  if (!sections.has(ANLAND_PROFILE)) {
+    sections.set(ANLAND_PROFILE, sections.get(MIGRATED_PROFILE).map(cloneRule));
+  }
+
+  state.profiles = [...sections].map(([name, rules]) => ({ name, rules }));
+  const fallback = state.profiles.some((profile) => profile.name === activeName)
+    ? activeName
+    : state.profiles[0].name;
+  useProfile(fallback);
 }
 
 function parseDevices(text) {
@@ -490,7 +588,38 @@ function ruleTarget(rule) {
   return chips(rule.target || []);
 }
 
+function renderProfileSelect() {
+  const select = $("#profileSelect");
+  if (!select) return;
+  select.innerHTML = state.profiles
+    .map((profile) => {
+      const chosen = profile.name === state.activeProfile ? " selected" : "";
+      return `<option value="${html(profile.name)}"${chosen}>${html(profile.name)}（${profile.rules.length} 条）</option>`;
+    })
+    .join("");
+  const note = $("#profileNote");
+  if (note) {
+    note.textContent = state.activeProfile === ANLAND_PROFILE
+      ? "进入沉浸模式时自动使用"
+      : "";
+  }
+}
+
+function switchProfile(name) {
+  if (!name || name === state.activeProfile) return;
+  useProfile(name);
+  // An editor opened against the old profile would write its rule into the new
+  // one, which is exactly the cross-contamination profiles exist to prevent.
+  state.editor = null;
+  state.mappingUi.addOpen = false;
+  state.mappingUi.draft = null;
+  closeEditor();
+  renderMappings();
+  setNotice(`已切到「${name}」，保存并应用后生效。`);
+}
+
 function renderMappings() {
+  renderProfileSelect();
   const list = $("#mappingList");
   $("#emptyMappings").hidden = state.rules.length !== 0;
   const fnTransform = state.rules.some((rule) => rule.type === "keys" && rule.source.length === 1 && rule.source[0] === "KEY_F23" && rule.target.length === 1 && rule.target[0] === "KEY_FN");
@@ -1052,11 +1181,7 @@ function saveRule() {
   setNotice("规则已更新，保存并应用后生效。");
 }
 
-function configText() {
-  const lines = ["version=1"];
-  if (state.auto) lines.push("device=auto");
-  else [...state.selected].forEach((device) => lines.push(`device=${device}`));
-  state.rules.forEach((rule) => {
+function appendRuleLines(lines, rule) {
     if (rule.type === "app") {
       const mode = rule.freeform ? "freeform" : "normal";
       const repeatMode = rule.closeOnRepeat ? "|toggle" : "";
@@ -1072,6 +1197,21 @@ function configText() {
     } else {
       lines.push(`mapping=${rule.source.join("+")}=>${rule.target.join("+")}`);
     }
+}
+
+function configText() {
+  const lines = ["version=1"];
+  if (state.auto) lines.push("device=auto");
+  else [...state.selected].forEach((device) => lines.push(`device=${device}`));
+  // Which profile the daemon should run. Written explicitly so the file says
+  // what it means without having to know the daemon's fallback rules.
+  lines.push(`active_profile=${state.activeProfile}`);
+  // Every profile is written, not only the active one: a profile that is not
+  // in the file is one the daemon cannot switch to -- and the Anland profile
+  // exists precisely to be switched to by something other than this page.
+  state.profiles.forEach((profile) => {
+    lines.push(`profile=${profile.name}`);
+    profile.rules.forEach((rule) => appendRuleLines(lines, rule));
   });
   return `${lines.join("\n")}\n`;
 }
@@ -1198,7 +1338,7 @@ async function restoreDefaults() {
   if (!window.confirm(message)) return;
   state.auto = true;
   state.selected.clear();
-  state.rules = defaultRules();
+  replaceActiveRules(defaultRules());
   closeEditor();
   renderDevices();
   renderMappings();
@@ -1258,7 +1398,9 @@ async function initialize() {
 }
 
 $("#refreshDevices").addEventListener("click", refreshDevices);
+$("#measureLatency").addEventListener("click", measureLatency);
 $("#themeToggle").addEventListener("click", cycleTheme);
+$("#profileSelect").addEventListener("change", (event) => switchProfile(event.target.value));
 $("#saveConfig").addEventListener("click", saveConfig);
 $("#restoreDefaults").addEventListener("click", restoreDefaults);
 $("#cancelEdit").addEventListener("click", closeEditor);
@@ -1333,6 +1475,103 @@ $("#mappingAddPanel").addEventListener("click", (event) => {
   const option = event.target.closest("[data-add-role]");
   if (option) chooseMappingPart(option);
 });
+
+/*
+ * The daemon measures its own read-to-write gap, which is the whole point of
+ * the figure: a shell-based measurement would be dominated by the cost of
+ * launching the measuring tool. What is left to get wrong is the line itself,
+ * so both shapes are handled explicitly -- a reading, and the error codes
+ * keyboardctl reports when the snapshot is missing, stale, or not what it
+ * claims to be. Showing an aged-out number as a current one would be worse
+ * than showing nothing.
+ */
+function parseLatencyLine(line) {
+  const fields = String(line || "").trim().split("\t");
+  if (fields.length < 4 || fields[0] !== "GOLDCTL1" || fields[1] !== "latency") {
+    return null;
+  }
+  if (fields[2] === "error") {
+    return { error: fields[3].replace(/^code=/, "") };
+  }
+  // Positional and exact, matching what keyboardctl validates before it will
+  // pass a reading on at all.
+  if (fields[2] !== "ok" || fields[3] !== "code=ready" || fields.length !== 12) {
+    return null;
+  }
+  const values = {};
+  for (let index = 4; index < fields.length; index++) {
+    const separator = fields[index].indexOf("=");
+    if (separator < 0) {
+      return null;
+    }
+    values[fields[index].slice(0, separator)] = fields[index].slice(separator + 1);
+  }
+  return { values };
+}
+
+function formatMicros(value) {
+  const micros = Number(value);
+  if (!Number.isFinite(micros)) {
+    return "—";
+  }
+  return micros < 1000 ? `${micros} µs` : `${(micros / 1000).toFixed(2)} ms`;
+}
+
+const LATENCY_ERROR_TEXT = {
+  "no-snapshot": "Gold 还没有开始测量，先在键盘上按几下再读取",
+  "no-heartbeat": "读不到快照的更新时间",
+  "no-clock": "读不到系统时间",
+  "stale": "读数已经过期，Gold 可能没有在运行",
+  "malformed": "快照内容无法解析",
+};
+
+async function measureLatency() {
+  const button = $("#measureLatency");
+  const readout = $("#latencyReadout");
+  const note = $("#latencyNote");
+  if (!button || !readout || !note) {
+    return;
+  }
+  button.disabled = true;
+  readout.textContent = "读取中…";
+  note.textContent = "";
+
+  let line = "";
+  try {
+    const result = await exec(`${CONTROL} latency`);
+    line = result.stdout;
+  } catch (error) {
+    // keyboardctl exits non-zero for every error code, and exec turns that into
+    // a rejection carrying the very line this needs to read.
+    line = String((error && error.message) || "");
+  }
+  button.disabled = false;
+
+  const parsed = parseLatencyLine(line);
+  if (!parsed) {
+    readout.textContent = "读数无法解析";
+    return;
+  }
+  if (parsed.error) {
+    readout.textContent = LATENCY_ERROR_TEXT[parsed.error] || `读取失败（${parsed.error}）`;
+    return;
+  }
+
+  const values = parsed.values;
+  if (Number(values.count) === 0) {
+    readout.textContent = "还没有采样，按几下外接键盘再读取";
+    return;
+  }
+  // Every value goes through formatMicros, which yields a fixed shape or a
+  // dash, so nothing here can smuggle markup into the page.
+  readout.innerHTML =
+    `<span class="latency-figure"><strong>${formatMicros(values.avg_us)}</strong><small>平均</small></span>` +
+    `<span class="latency-figure"><strong>${formatMicros(values.last_us)}</strong><small>最近一次</small></span>` +
+    `<span class="latency-figure"><strong>${formatMicros(values.min_us)}</strong><small>最低</small></span>` +
+    `<span class="latency-figure"><strong>${formatMicros(values.max_us)}</strong><small>最高</small></span>`;
+  note.textContent = `最近 ${values.window} 次按键 · 累计 ${values.count} 次`;
+}
+
 initialize();
 applyTheme(storedTheme());
 const colorScheme = window.matchMedia?.("(prefers-color-scheme: dark)");

@@ -4,6 +4,12 @@ MODDIR=${0%/*}
 MODDIR=${MODDIR%/bin}
 CONFIG="$MODDIR/config.conf"
 PAUSE_REQUEST="$MODDIR/paused"
+INPUT_STATUS="$MODDIR/input-status"
+LATENCY_STATUS="$MODDIR/latency-status"
+# How long a snapshot may go unrefreshed before it counts as abandoned. The
+# daemon rewrites the file on every poll tick (1s), so this is several ticks of
+# slack, not a race.
+INPUT_STATUS_STALE_SECONDS=6
 
 write_defaults() {
     [ -f "$CONFIG" ] && return 0
@@ -102,9 +108,168 @@ capture_keys() {
     fi
 }
 
+# Reports which physical nodes the daemon currently holds under EVIOCGRAB.
+#
+# This is a pure read. It takes no lease, sends no signal, runs no probe and
+# changes nothing: a node the daemon grabbed stays grabbed whether or not anyone
+# asks about it. On any doubt it prints a canonical error and exits non-zero, so
+# the caller can tell "Gold holds nothing" apart from "I could not find out" —
+# those must never be the same answer.
+input_status() {
+    if [ ! -f "$INPUT_STATUS" ]; then
+        printf 'GOLDCTL1\tinput-status\terror\tcode=no-snapshot\n'
+        return 1
+    fi
+
+    # The file's mtime is the heartbeat. A worker that died without cleaning up
+    # leaves its last claim behind; letting that age out is what stops a dead
+    # Gold from pinning nodes it no longer holds.
+    mtime="$(stat -c %Y "$INPUT_STATUS" 2>/dev/null)"
+    now="$(date +%s)"
+    case "$mtime" in
+        ''|*[!0-9]*)
+            printf 'GOLDCTL1\tinput-status\terror\tcode=no-heartbeat\n'
+            return 1
+            ;;
+    esac
+    case "$now" in
+        ''|*[!0-9]*)
+            printf 'GOLDCTL1\tinput-status\terror\tcode=no-clock\n'
+            return 1
+            ;;
+    esac
+    age=$((now - mtime))
+    if [ "$age" -lt 0 ] || [ "$age" -gt "$INPUT_STATUS_STALE_SECONDS" ]; then
+        printf 'GOLDCTL1\tinput-status\terror\tcode=stale\n'
+        return 1
+    fi
+
+    # The whole file, not just its first line: a valid line followed by junk is
+    # not a snapshot we understand. The daemon only ever writes one line, so
+    # anything else means the file is not ours to trust.
+    line="$(cat "$INPUT_STATUS" 2>/dev/null)"
+    # Kept deliberately in step with GoldInputStatusClient.parseReady() on the
+    # Android side: same field order, same grammar, same 32-node cap. If the two
+    # ever disagree, this one emitting a line the other rejects would turn a
+    # perfectly good snapshot into UNKNOWN.
+    if ! printf '%s\n' "$line" | awk -F'\t' '
+        function bad() { exit 1 }
+        {
+            # 10 fields when the claimed set is present. It arrived after the
+            # first release, so both shapes are still served.
+            if (NF != 9 && NF != 10) bad()
+            if ($1 != "GOLDCTL1" || $2 != "input-status" || $3 != "ok" || $4 != "code=ready") bad()
+            # Positional and exact: a reordered field is not a snapshot we act on.
+            if ($5 !~ /^boot_id=/ || $6 !~ /^generation=/ || $7 !~ /^instance=/ ||
+                $8 !~ /^count=/ || $9 !~ /^nodes=/) bad()
+
+            boot = substr($5, 9)
+            generation = substr($6, 12)
+            instance = substr($7, 10)
+            count = substr($8, 7)
+            nodes = substr($9, 7)
+
+            if (boot !~ /^[A-Za-z0-9_-]{1,128}$/) bad()
+            if (instance !~ /^[A-Za-z0-9_-]{16,128}$/) bad()
+            if (generation !~ /^[0-9]{1,18}$/ || generation + 0 < 1) bad()
+            if (count !~ /^[0-9]{1,2}$/ || count + 0 > 32) bad()
+            if (count + 0 == 0) {
+                # Verified empty is spelled with a dash; nothing else means empty.
+                if (nodes != "-") bad()
+            } else {
+                n = split(nodes, parts, ",")
+                if (n != count + 0) bad()
+                for (j = 1; j <= n; j++) {
+                    if (parts[j] !~ /^event(0|[1-9][0-9]*)$/) bad()
+                    # Ascending order is what makes duplicates impossible.
+                    if (j > 1 && parts[j-1] >= parts[j]) bad()
+                }
+            }
+            if (NF == 10) {
+                if ($10 !~ /^claimed=/) bad()
+                claimed = substr($10, 9)
+                if (claimed != "-") {
+                    m = split(claimed, cparts, ",")
+                    if (m > 32) bad()
+                    for (k = 1; k <= m; k++) {
+                        if (cparts[k] !~ /^event(0|[1-9][0-9]*)$/) bad()
+                        if (k > 1 && cparts[k-1] >= cparts[k]) bad()
+                    }
+                }
+            }
+        }
+    '; then
+        printf 'GOLDCTL1\tinput-status\terror\tcode=malformed\n'
+        return 1
+    fi
+
+    printf '%s\n' "$line"
+}
+
+latency() {
+    if [ ! -f "$LATENCY_STATUS" ]; then
+        printf 'GOLDCTL1\tlatency\terror\tcode=no-snapshot\n'
+        return 1
+    fi
+
+    # Same heartbeat rule as input-status: the mtime is how a reader tells a
+    # live worker from one that died holding the file.
+    mtime="$(stat -c %Y "$LATENCY_STATUS" 2>/dev/null)"
+    now="$(date +%s)"
+    case "$mtime" in
+        ''|*[!0-9]*)
+            printf 'GOLDCTL1\tlatency\terror\tcode=no-heartbeat\n'
+            return 1
+            ;;
+    esac
+    case "$now" in
+        ''|*[!0-9]*)
+            printf 'GOLDCTL1\tlatency\terror\tcode=no-clock\n'
+            return 1
+            ;;
+    esac
+    age=$((now - mtime))
+    if [ "$age" -lt 0 ] || [ "$age" -gt "$INPUT_STATUS_STALE_SECONDS" ]; then
+        printf 'GOLDCTL1\tlatency\terror\tcode=stale\n'
+        return 1
+    fi
+
+    line="$(cat "$LATENCY_STATUS" 2>/dev/null)"
+    # Positional and exact, like the device snapshot: this grammar is what a
+    # reader parses, so a reordered or renamed field is not a reading.
+    if ! printf '%s\n' "$line" | awk -F'\t' '
+        function bad() { exit 1 }
+        {
+            if (NF != 12) bad()
+            if ($1 != "GOLDCTL1" || $2 != "latency" || $3 != "ok" || $4 != "code=ready") bad()
+            if ($5 !~ /^boot_id=/ || $6 !~ /^instance=/) bad()
+            if ($7 !~ /^count=[0-9]+$/ || $8 !~ /^window=[0-9]+$/) bad()
+            if ($9 !~ /^last_us=[0-9]+$/ || $10 !~ /^min_us=[0-9]+$/) bad()
+            if ($11 !~ /^avg_us=[0-9]+$/ || $12 !~ /^max_us=[0-9]+$/) bad()
+            # The window has to describe itself consistently. Sentinels for an
+            # empty window are all zero, so only check once there are samples.
+            split($10, lo, "="); split($11, mid, "="); split($12, hi, "=")
+            if (mid[2] + 0 > 0) {
+                if (lo[2] + 0 > mid[2] + 0 || mid[2] + 0 > hi[2] + 0) bad()
+            }
+        }
+    '; then
+        printf 'GOLDCTL1\tlatency\terror\tcode=malformed\n'
+        return 1
+    fi
+
+    printf '%s\n' "$line"
+}
+
 case "${1:-}" in
     ensure)
         write_defaults
+        ;;
+    input-status)
+        input_status
+        ;;
+    latency)
+        latency
         ;;
     list)
         list_devices
@@ -128,7 +293,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        echo "usage: keyboardctl {ensure|list|apps|capture [seconds] [single|combo]|restart|status}" >&2
+        echo "usage: keyboardctl {ensure|list|apps|capture [seconds] [single|combo]|input-status|latency|restart|status}" >&2
         exit 2
         ;;
 esac
