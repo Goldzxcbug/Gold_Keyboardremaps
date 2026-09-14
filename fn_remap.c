@@ -72,14 +72,10 @@
 // Zero would not do instead: Android only takes the vendor/product branch when
 // both are non-zero, and falls back to Generic.kl otherwise.
 //
-// These two are an anchor, not a private detail. Two other places spell out the
-// same numbers, and nothing in the build compares them:
-//   * keylayout.sh derives its file name, Vendor_ffff_Product_ffff.kl, from
-//     them. Change only one side and Android resolves no layout of ours, so the
-//     Meta key silently goes back to being swallowed by ROMs that reserve it.
-//   * GoldUinputBusSession.java in the Anland consumer app matches this keyboard
-//     by the same ids. Change only one side and the app stops recognising it.
-// tests/test_device_identity.sh checks both against this file.
+// Anland's root input helper identifies these output nodes by name and ids,
+// grabs them during immersive sessions, and streams the already-remapped evdev
+// events to the desktop. Android receives the output again after it ungrabs.
+// tests/test_device_identity.sh checks the native helper and app discovery.
 #define VIRTUAL_VENDOR 0xffff
 #define VIRTUAL_PRODUCT 0xffff
 #define RETRY_DELAY_INITIAL_SECONDS 2
@@ -170,6 +166,7 @@ static volatile sig_atomic_t keep_running = 1;
 static void index_config_keys(Config *config);
 static int emit_key(DeviceContext *device, const struct input_event *original, int key, int value);
 static int flush_forwarded_events(DeviceContext *device);
+static int write_event(int fd, const struct input_event *event);
 
 static const KeyName k_key_names[] = {
     {"KEY_ESC", KEY_ESC}, {"KEY_1", KEY_1}, {"KEY_2", KEY_2},
@@ -701,11 +698,13 @@ static void release_all_keys(DeviceContext *device) {
     struct input_event release;
     memset(&release, 0, sizeof(release));
     release.type = EV_KEY;
+    bool released = false;
 
     for (int key = 0; key <= KEY_MAX; key++) {
         if (device->target_refs[key] != 0) {
             device->target_refs[key] = 0;
             (void)emit_key(device, &release, key, 0);
+            released = true;
         }
         device->pressed[key] = false;
         device->pending[key] = false;
@@ -713,6 +712,13 @@ static void release_all_keys(DeviceContext *device) {
         device->forwarded[key] = false;
     }
     memset(device->active_rules, 0, sizeof(device->active_rules));
+    if (released) {
+        // Commit releases even if no further physical event follows a profile
+        // switch. The exclusive Anland reader also waits for SYN_REPORT.
+        struct input_event sync = {.type = EV_SYN, .code = SYN_REPORT};
+        (void)flush_forwarded_events(device);
+        (void)write_event(device->virtual_fd, &sync);
+    }
     (void)flush_forwarded_events(device);
 }
 

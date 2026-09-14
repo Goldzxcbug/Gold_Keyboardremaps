@@ -6,6 +6,7 @@ Gold Keyboard Remaps 是一个 KernelSU 模块。它拦截指定的 Linux 输入
 
 - 自动识别外接 USB、蓝牙和 HID 键盘，也支持手动选择输入节点。
 - 支持单键映射、组合键映射和多个输出键。
+- 保留独立的 `Anland` 配置方案，进入沉浸时自动使用，退出后恢复原方案。
 - 支持按键捕获，减少手动查找 Linux 按键名称的工作。
 - 支持通过单键或组合键启动应用；在 ColorOS 上可选小窗启动和重复按键关闭。
 - 提供 KernelSU WebUI，用于查看设备、编辑规则、保存配置和暂停模块。
@@ -39,6 +40,8 @@ Gold_Keyboardremaps/
 ├── module.prop
 ├── service.sh
 ├── action.sh
+├── customize.sh                     # 安装时清理旧版 Meta 布局
+├── keylayout.sh                      # 升级清理脚本
 ├── config.conf
 ├── input-status                      # 运行时生成，见下
 ├── bin/
@@ -53,6 +56,17 @@ Gold_Keyboardremaps/
 
 `input-status` 由 `fn-remap` 在运行时写入（原子替换），不需要打包，也不应手动编辑。
 它记录转发器当前实际独占（`EVIOCGRAB`）的物理节点，供 Anland 判断哪些节点不能碰。
+
+Anland 的 Gold 输入来源直接独占本模块的虚拟输出节点，读取重映射后的原始事件并送入容器。
+沉浸期间这些键盘事件不会经过 Android 的 `KeyEvent` 分发；退出后解除独占，安卓恢复接收。
+物理键盘继续由 Gold 读取、重映射，Anland 不会绕过配置直接接管同一物理键盘。
+
+`profile=Anland` 中的独立规则会保留。Anland 会话通过 `anland-profile` 请求文件触发方案切换，
+退出后移除请求并恢复 `active_profile` 指定的方案。请求文件只选择方案，不承担事件传输。
+如果配置里没有 Anland 方案，继续使用当前规则。
+
+`keylayout.sh` 现在只清理旧版生成的 Meta 特殊布局。升级后重启，使安卓重新加载原生布局；
+请同时使用支持 Gold 原始输入的新版 Anland。
 
 `fn_remap.c` 需要使用 Android 目标架构编译为 `bin/fn-remap`。如果要启用 ColorOS 小窗或系统截屏，需要使用 Android SDK 的 `android.jar` 编译 `ColorOS.java`，并把生成的类打包为 `bin/coloros-window-launcher.jar`。
 

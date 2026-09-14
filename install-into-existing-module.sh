@@ -38,9 +38,7 @@ cp "$STAGEDIR/keylayout.sh" "$MODDIR/keylayout.sh.new"
 chmod 755 "$MODDIR/keylayout.sh.new"
 mv "$MODDIR/keylayout.sh.new" "$MODDIR/keylayout.sh"
 
-# Build the key layout now rather than waiting for the first boot to notice it
-# is missing: the overlay is assembled at boot, so the file has to be in place
-# beforehand for the Meta key to work on the very first boot after installing.
+# Retire the old Meta override before the next boot overlay is assembled.
 GOLD_MODULE_DIR="$MODDIR" /system/bin/sh "$MODDIR/keylayout.sh"
 
 echo "Installed Gboard-compatible Fn remapper"

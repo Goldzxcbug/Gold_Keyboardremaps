@@ -129,7 +129,7 @@ jobs:
           unzip -l build/module/bin/coloros-window-launcher.jar | grep -F 'classes.dex'
 
           install -m 0644 module.prop config.conf build/module/
-          install -m 0755 service.sh action.sh build/module/
+          install -m 0755 service.sh action.sh keylayout.sh customize.sh build/module/
           install -m 0755 keyboardctl build/module/bin/keyboardctl
           cp -a webroot build/module/
 
