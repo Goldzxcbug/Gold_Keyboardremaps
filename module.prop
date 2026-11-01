@@ -1,6 +1,6 @@
 id=Gold_Keyboardremaps
 name=Gold Keyboard Remaps
-version=1.1.0
-versionCode=2
+version=1.1.1
+versionCode=3
 author=酷安@Goldbug
 description=通过 Linux 输入事件拦截与虚拟输入技术，为你的键盘添加更多功能。
