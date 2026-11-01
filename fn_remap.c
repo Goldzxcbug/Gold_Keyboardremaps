@@ -154,6 +154,11 @@ typedef struct {
     bool pending[KEY_MAX + 1];
     bool suppressed[KEY_MAX + 1];
     bool forwarded[KEY_MAX + 1];
+    // Track what actually reached uinput, including fast passthrough and Fn.
+    bool output_down[KEY_MAX + 1];
+    // After input loss, held physical keys re-arm only on their real release.
+    bool ignore_until_up[KEY_MAX + 1];
+    bool discarding_frame;
     bool active_rules[MAX_RULES];
     unsigned int target_refs[KEY_MAX + 1];
     struct input_event output_batch[OUTPUT_BATCH_EVENTS];
@@ -694,18 +699,23 @@ static bool profile_switch_pending(void) {
  * for good. Whatever the user is still holding physically simply stops being
  * forwarded until they press it again: an interruption, not a stuck key.
  */
-static void release_all_keys(DeviceContext *device) {
+static int release_all_keys(DeviceContext *device) {
+    if (flush_forwarded_events(device) < 0) {
+        return -1;
+    }
     struct input_event release;
     memset(&release, 0, sizeof(release));
     release.type = EV_KEY;
     bool released = false;
 
     for (int key = 0; key <= KEY_MAX; key++) {
-        if (device->target_refs[key] != 0) {
-            device->target_refs[key] = 0;
-            (void)emit_key(device, &release, key, 0);
+        if (device->output_down[key] || device->target_refs[key] != 0) {
+            if (emit_key(device, &release, key, 0) < 0) {
+                return -1;
+            }
             released = true;
         }
+        device->target_refs[key] = 0;
         device->pressed[key] = false;
         device->pending[key] = false;
         device->suppressed[key] = false;
@@ -716,10 +726,12 @@ static void release_all_keys(DeviceContext *device) {
         // Commit releases even if no further physical event follows a profile
         // switch. The exclusive Anland reader also waits for SYN_REPORT.
         struct input_event sync = {.type = EV_SYN, .code = SYN_REPORT};
-        (void)flush_forwarded_events(device);
-        (void)write_event(device->virtual_fd, &sync);
+        if (flush_forwarded_events(device) < 0 ||
+            write_event(device->virtual_fd, &sync) < 0) {
+            return -1;
+        }
     }
-    (void)flush_forwarded_events(device);
+    return flush_forwarded_events(device);
 }
 
 static bool is_virtual_name(const char *name) {
@@ -933,19 +945,34 @@ static int write_event(int fd, const struct input_event *event) {
     return write_events(fd, event, 1);
 }
 
+// Record successful output in one place; input/rule state is not an output ledger.
+static int write_forwarded_events(DeviceContext *device, const struct input_event *events,
+                                  size_t count) {
+    if (write_events(device->virtual_fd, events, count) < 0) {
+        return -1;
+    }
+    for (size_t index = 0; index < count; index++) {
+        const struct input_event *event = &events[index];
+        if (event->type == EV_KEY && event->code <= KEY_MAX && event->value != 2) {
+            device->output_down[event->code] = event->value != 0;
+        }
+    }
+    return 0;
+}
+
 static int flush_forwarded_events(DeviceContext *device) {
     if (device->output_batch_count == 0) {
         return 0;
     }
-    int result = write_events(device->virtual_fd, device->output_batch,
-                              device->output_batch_count);
+    int result = write_forwarded_events(device, device->output_batch,
+                                        device->output_batch_count);
     device->output_batch_count = 0;
     return result;
 }
 
 static int forward_event(DeviceContext *device, const struct input_event *event) {
     if (!device->batching_output) {
-        return write_event(device->virtual_fd, event);
+        return write_forwarded_events(device, event, 1);
     }
     if (device->output_batch_count == OUTPUT_BATCH_EVENTS &&
         flush_forwarded_events(device) < 0) {
@@ -1468,7 +1495,15 @@ static int handle_key_event(DeviceContext *device, const Config *config,
                            : forward_event(device, event);
 }
 
-static bool is_direct_passthrough_event(const struct input_event *event, const Config *config) {
+static bool is_direct_passthrough_event(const DeviceContext *device,
+                                       const struct input_event *event, const Config *config) {
+    if (event->type == EV_SYN && event->code == SYN_DROPPED) {
+        return false;
+    }
+    if (event->type == EV_KEY && event->code <= KEY_MAX &&
+        device->ignore_until_up[event->code]) {
+        return false;
+    }
     if (event->type == EV_MSC && event->code == MSC_SCAN) {
         return false;
     }
@@ -1501,12 +1536,45 @@ static int handle_source(DeviceContext *device, const Config *config) {
     }
     size_t event_count = (size_t)count / sizeof(*events);
     for (size_t index = 0; index < event_count;) {
-        if (is_direct_passthrough_event(&events[index], config)) {
+        const struct input_event *current = &events[index];
+        if (current->type == EV_SYN && current->code == SYN_DROPPED) {
+            // Do not trust any queued transition until the recovery SYN_REPORT.
+            // Clear uinput too: an Anland reconnect waits for these keys to be up.
+            if (release_all_keys(device) < 0) {
+                return -1;
+            }
+            device->discarding_frame = true;
+            index++;
+            continue;
+        }
+        if (device->discarding_frame) {
+            if (is_syn_report(current)) {
+                uint8_t held[(KEY_MAX + 8) / 8] = {0};
+                if (ioctl(device->source_fd, EVIOCGKEY(sizeof(held)), held) < 0) {
+                    return -1; // Recreate the device if its state cannot be read.
+                }
+                for (int key = 0; key <= KEY_MAX; key++) {
+                    device->ignore_until_up[key] = bit_is_set(held, (unsigned int)key);
+                }
+                device->discarding_frame = false;
+            }
+            index++;
+            continue;
+        }
+        if (current->type == EV_KEY && current->code <= KEY_MAX &&
+            device->ignore_until_up[current->code]) {
+            if (current->value == 0) {
+                device->ignore_until_up[current->code] = false;
+            }
+            index++;
+            continue;
+        }
+        if (is_direct_passthrough_event(device, &events[index], config)) {
             size_t first = index++;
-            while (index < event_count && is_direct_passthrough_event(&events[index], config)) {
+            while (index < event_count && is_direct_passthrough_event(device, &events[index], config)) {
                 index++;
             }
-            if (write_events(device->virtual_fd, &events[first], index - first) < 0) {
+            if (write_forwarded_events(device, &events[first], index - first) < 0) {
                 return -1;
             }
             continue;
@@ -2140,7 +2208,9 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Con
             // swapped underneath them.
             if (profile_switch_pending()) {
                 for (size_t index = 0; index < count; index++) {
-                    release_all_keys(&devices[index]);
+                    if (release_all_keys(&devices[index]) < 0) {
+                        return -1;
+                    }
                 }
                 char profile[PROFILE_NAME_MAX];
                 resolve_active_profile(profile, sizeof(profile));
