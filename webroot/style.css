@@ -181,6 +181,7 @@ main { width: min(980px, 100%); margin: 0 auto; padding: 20px; }
 .mapping-arrow { color: var(--muted); font-size: 20px; }
 .empty-state { padding: 28px 12px; color: var(--muted); text-align: center; border: 1px dashed var(--line); border-radius: 6px; }
 .mapping-hint { margin: 0 0 12px; padding: 9px 11px; color: var(--muted); background: var(--surface-alt); border-radius: 5px; font-size: 12px; }
+.mapping-behavior-hint { color: var(--text); border-left: 3px solid var(--accent); background: var(--accent-soft); }
 .mapping-add-panel { margin: 0 0 14px; padding: 16px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface-alt); }
 .mapping-add-panel[hidden] { display: none; }
 .add-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
@@ -301,6 +302,10 @@ body.modal-open { overflow: hidden; }
 
 .profile-row select {
   min-width: 9rem;
+}
+
+.prefix-row select {
+  min-width: 11rem;
 }
 
 .profile-note {

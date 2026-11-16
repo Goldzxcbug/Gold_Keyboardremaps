@@ -113,6 +113,8 @@ check(migrated.includes('active_profile=方案一'),
   'the migrated file names its active profile');
 check(migrated.includes('profile=方案一'),
   'the migrated file writes sections');
+check(migrated.includes('prefix=KEY_FN'),
+  'a config without a prefix writes the default Fn prefix');
 
 // The daemon must still resolve the same rules after the migration: writing
 // active_profile=方案一 with the rules under profile=方案一 is only correct if
@@ -149,6 +151,16 @@ check(activeProfile(roundTripped) === '方案二', 'the active profile survives 
 check(roundTripped.includes('profile=方案三'),
   'the fixed profiles are written even when empty');
 
+// ---- the global prefix setting ------------------------------------------
+
+const prefixed = 'version=1\nprefix=KEY_LEFTALT\ndevice=auto\nmapping=KEY_A=>KEY_B\n';
+check(roundTrip(prefixed).includes('prefix=KEY_LEFTALT'),
+  'the global prefix survives a round trip');
+check(roundTrip('version=1\nprefix=none\ndevice=auto\nmapping=KEY_A=>KEY_B\n').includes('prefix=none'),
+  'an explicitly disabled global prefix stays disabled');
+check(ruleCount('version=1\nprefix=KEY_LEFTALT\nprofile=方案一\nmapping=KEY_A=>KEY_B\n', '方案一') === 1,
+  'the prefix line is not read as a mapping rule');
+
 // ---- the Anland profile --------------------------------------------------
 
 check(ruleCount(legacy, 'Anland') === 2,
@@ -169,6 +181,21 @@ vm.runInContext('useProfile("方案二"), state.rules.push({ type: "keys", sourc
 const edited = vm.runInContext('configText()', sandbox);
 check(ruleCount(edited, '方案二') === 3, 'a rule added while editing lands in the active profile');
 check(ruleCount(edited, '方案一') === 1, 'and does not leak into another profile');
+
+// ---- global prefix auto-completion --------------------------------------
+
+vm.runInContext('state.prefix = "KEY_FN"', sandbox);
+check(vm.runInContext('applyGlobalPrefix(["KEY_1"], true).join("+")', sandbox) === 'KEY_FN+KEY_1',
+  'the global prefix is prepended to a new key combo');
+check(vm.runInContext('applyGlobalPrefix(["KEY_FN", "KEY_1"], true).join("+")', sandbox) === 'KEY_FN+KEY_1',
+  'an existing prefix is not duplicated');
+check(vm.runInContext('applyGlobalPrefix(["KEY_1"], false).join("+")', sandbox) === 'KEY_1',
+  'single-key and non-key rules are not prefixed');
+check(vm.runInContext('applyGlobalPrefix(["KEY_LEFTCTRL", "KEY_Q"], true).join("+")', sandbox) === 'KEY_LEFTCTRL+KEY_Q',
+  'a deliberate modifier chord is left alone');
+vm.runInContext('state.prefix = ""', sandbox);
+check(vm.runInContext('applyGlobalPrefix(["KEY_1"], true).join("+")', sandbox) === 'KEY_1',
+  'an empty global prefix adds nothing');
 
 console.log('\n' + (failures === 0 ? 'all checks passed' : 'there were failures'));
 process.exit(failures === 0 ? 0 : 1);

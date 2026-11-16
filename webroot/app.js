@@ -12,6 +12,17 @@ const ANLAND_PROFILE = "Anland";
 // Rules that appear before the first profile= line keep this name, which is
 // what the daemon calls the implicit section.
 const DEFAULT_PROFILE = "默认";
+// The global prefix is a WebUI editing aid: new key-output combos get this key
+// prepended. The daemon still reads the prefix from each rule's source list.
+const DEFAULT_GLOBAL_PREFIX = "KEY_FN";
+// A combo that already starts from a modifier is a deliberate modifier chord,
+// not a layer chord. Do not silently add Fn (or any other layer) in front of it.
+const MODIFIER_PREFIX_KEYS = new Set([
+  "KEY_LEFTCTRL", "KEY_RIGHTCTRL",
+  "KEY_LEFTSHIFT", "KEY_RIGHTSHIFT",
+  "KEY_LEFTALT", "KEY_RIGHTALT",
+  "KEY_LEFTMETA", "KEY_RIGHTMETA", "KEY_COMPOSE",
+]);
 
 const KEYS = [
   ["KEY_F23", "F23（厂商功能键）"],
@@ -137,6 +148,9 @@ const state = {
   rules: [],
   profiles: [],
   activeProfile: MIGRATED_PROFILE,
+  // Global prefix used when the WebUI builds a new key-output combo. It is a
+  // convenience for rule editing; existing rules keep their own source keys.
+  prefix: DEFAULT_GLOBAL_PREFIX,
   editor: null,
   mappingUi: {
     expanded: false,
@@ -151,6 +165,22 @@ function cloneRule(rule) {
     source: [...rule.source],
     target: rule.target ? [...rule.target] : rule.target,
   };
+}
+
+/**
+ * Puts the global prefix first in a new key-output combo.
+ *
+ * Only the WebUI's rule creation uses this. The daemon keeps reading the real
+ * prefix from each rule, so existing rules are never rewritten behind the
+ * user's back. `enabled` is false for single-key rules and non-key actions;
+ * a chord that already uses Ctrl/Shift/Alt/Meta is left alone even when it is
+ * enabled.
+ */function applyGlobalPrefix(source, enabled) {
+  if (!enabled || !state.prefix || source.includes(state.prefix) ||
+      source.some((code) => MODIFIER_PREFIX_KEYS.has(code))) {
+    return [...source];
+  }
+  return [state.prefix, ...source];
 }
 
 function profileNamed(name) {
@@ -315,6 +345,7 @@ function parseConfig(text) {
   state.auto = false;
   state.selected.clear();
   state.profiles = [];
+  state.prefix = DEFAULT_GLOBAL_PREFIX;
 
   // Rules are collected per section while reading, then handed to the state at
   // the end: the config may name its active profile before, after, or in the
@@ -338,6 +369,13 @@ function parseConfig(text) {
     }
     if (line.startsWith("active_profile=")) {
       activeName = line.slice(15).trim() || null;
+      continue;
+    }
+    if (line.startsWith("prefix=")) {
+      const value = line.slice(7).trim();
+      state.prefix = value === "" || value === "none"
+        ? ""
+        : (KEYS.some(([code]) => code === value) ? value : DEFAULT_GLOBAL_PREFIX);
       continue;
     }
     if (line === "device=auto") {
@@ -618,8 +656,43 @@ function switchProfile(name) {
   setNotice(`已切到「${name}」，保存并应用后生效。`);
 }
 
+/*
+ * Keys already mapped to Fn are layer sources themselves: the daemon
+ * canonicalises them to KEY_FN, so a rule that uses the raw code as a prefix
+ * would never complete. Keep them visible in the select but do not offer them
+ * for new prefixes.
+ */
+function transformSources() {
+  const sources = new Set();
+  state.profiles.forEach((profile) => {
+    profile.rules.forEach((rule) => {
+      if (rule.type === "keys" && rule.source.length === 1 &&
+          rule.target?.length === 1 && rule.target[0] === "KEY_FN") {
+        sources.add(rule.source[0]);
+      }
+    });
+  });
+  return sources;
+}
+
+function renderPrefixSelect() {
+  const select = $("#globalPrefix");
+  if (!select) return;
+  const transforms = transformSources();
+  const options = ['<option value="">不自动添加</option>'];
+  KEYS.forEach(([code, label]) => {
+    const convertsToFn = transforms.has(code);
+    const disabled = convertsToFn && code !== state.prefix ? " disabled" : "";
+    const suffix = convertsToFn ? "（已转换为 Fn）" : "";
+    options.push(`<option value="${code}"${disabled}>${html(label)} (${code})${suffix}</option>`);
+  });
+  select.innerHTML = options.join("");
+  select.value = state.prefix || "";
+}
+
 function renderMappings() {
   renderProfileSelect();
+  renderPrefixSelect();
   const list = $("#mappingList");
   $("#emptyMappings").hidden = state.rules.length !== 0;
   const fnTransform = state.rules.some((rule) => rule.type === "keys" && rule.source.length === 1 && rule.source[0] === "KEY_F23" && rule.target.length === 1 && rule.target[0] === "KEY_FN");
@@ -1109,13 +1182,15 @@ function saveDraftRule() {
     setNotice("请先完成输入按键和功能选择。", true);
     return;
   }
+  const source = applyGlobalPrefix(draft.source,
+    draft.targetType === "keys" && draft.sourceMode === "combo");
   const rule = draft.targetType === "app"
-    ? { type: "app", source: draft.source, component: draft.component, freeform: draft.freeform, closeOnRepeat: draft.closeOnRepeat }
+    ? { type: "app", source, component: draft.component, freeform: draft.freeform, closeOnRepeat: draft.closeOnRepeat }
     : draft.targetType === "shell"
-      ? { type: "shell", source: draft.source, shellCommand: draft.shellCommand.trim(), shellRunAsRoot: draft.shellRunAsRoot }
+      ? { type: "shell", source, shellCommand: draft.shellCommand.trim(), shellRunAsRoot: draft.shellRunAsRoot }
       : draft.targetType === "screenshot"
-        ? { type: "screenshot", source: draft.source, screenshotMode: draft.screenshotMode }
-      : { type: "keys", source: draft.source, target: orderedOutputKeys(draft.target) };
+        ? { type: "screenshot", source, screenshotMode: draft.screenshotMode }
+      : { type: "keys", source, target: orderedOutputKeys(draft.target) };
   state.rules.push(rule);
   state.mappingUi.draft = null;
   state.mappingUi.addOpen = false;
@@ -1170,7 +1245,12 @@ function saveRule() {
       setNotice("请至少选择一个输出键。", true);
       return;
     }
-    rule = { type: "keys", source, target };
+    // Only a newly created combo gets the global prefix. Editing an existing
+    // rule must not silently rewrite the sources the user already saved.
+    const keyComboSource = state.editor.index === null && state.editor.mode === "combo"
+      ? applyGlobalPrefix(source, true)
+      : source;
+    rule = { type: "keys", source: keyComboSource, target };
   }
   if (state.editor.index === null) state.rules.push(rule);
   else state.rules[state.editor.index] = rule;
@@ -1200,7 +1280,7 @@ function appendRuleLines(lines, rule) {
 }
 
 function configText() {
-  const lines = ["version=1"];
+  const lines = ["version=1", `prefix=${state.prefix || "none"}`];
   if (state.auto) lines.push("device=auto");
   else [...state.selected].forEach((device) => lines.push(`device=${device}`));
   // Which profile the daemon should run. Written explicitly so the file says
@@ -1334,10 +1414,11 @@ function saveConfig() {
 }
 
 async function restoreDefaults() {
-  const message = "恢复默认设置会清除当前设备选择和全部自定义映射。是否继续？";
+  const message = "恢复默认设置会清除当前设备选择、全局前缀键和全部自定义映射。是否继续？";
   if (!window.confirm(message)) return;
   state.auto = true;
   state.selected.clear();
+  state.prefix = DEFAULT_GLOBAL_PREFIX;
   replaceActiveRules(defaultRules());
   closeEditor();
   renderDevices();
@@ -1401,6 +1482,12 @@ $("#refreshDevices").addEventListener("click", refreshDevices);
 $("#measureLatency").addEventListener("click", measureLatency);
 $("#themeToggle").addEventListener("click", cycleTheme);
 $("#profileSelect").addEventListener("change", (event) => switchProfile(event.target.value));
+$("#globalPrefix").addEventListener("change", (event) => {
+  state.prefix = event.target.value;
+  setNotice(state.prefix
+    ? `全局前缀键已设为 ${keyLabel(state.prefix)}；新建“按键输出”组合会自动加入，保存并应用后生效。`
+    : "已关闭全局前缀键自动添加；保存并应用后生效。");
+});
 $("#saveConfig").addEventListener("click", saveConfig);
 $("#restoreDefaults").addEventListener("click", restoreDefaults);
 $("#cancelEdit").addEventListener("click", closeEditor);
