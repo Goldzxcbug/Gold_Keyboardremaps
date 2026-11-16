@@ -138,6 +138,10 @@ typedef struct {
     size_t rule_count;
     bool mapping_sources[KEY_MAX + 1];
     bool key_action_sources[KEY_MAX + 1];
+    // Only the final source of a key-action chord is a trigger. Earlier keys
+    // are the chord's prefix/layer keys: while they are held, the final key
+    // triggers the mapping; otherwise the final key stays an ordinary key.
+    bool key_action_trigger_sources[KEY_MAX + 1];
     bool app_modifier_sources[KEY_MAX + 1];
     bool app_trigger_sources[KEY_MAX + 1];
     uint64_t trigger_rules[KEY_MAX + 1][RULE_INDEX_WORDS];
@@ -1113,7 +1117,15 @@ static void index_config_keys(Config *config) {
             config->source_rules[key][rule_index / 64] |= UINT64_C(1) << (rule_index % 64);
             if (rule->action == RULE_ACTION_KEYS) {
                 config->key_action_sources[key] = true;
-                config->trigger_rules[key][rule_index / 64] |= UINT64_C(1) << (rule_index % 64);
+                // A chord is completed by its final key. Earlier keys are
+                // prefixes and must not trigger on their own; otherwise a key
+                // like 1 in Fn+1 would be swallowed on press and could never
+                // repeat.
+                if (key_index + 1 == rule->source_count) {
+                    config->key_action_trigger_sources[key] = true;
+                    config->trigger_rules[key][rule_index / 64] |=
+                        UINT64_C(1) << (rule_index % 64);
+                }
             } else if (rule->action == RULE_ACTION_LAUNCH_APP ||
                        rule->action == RULE_ACTION_SHELL ||
                        rule->action == RULE_ACTION_SCREENSHOT) {
@@ -1162,6 +1174,33 @@ static bool rule_is_complete(const MappingRule *rule, const DeviceContext *devic
     return true;
 }
 
+/*
+ * Whether every prefix of a key-action chord is still held for it.
+ *
+ * A key that has already been forwarded -- because its own press could not be
+ * part of a chord at that moment, or because it was held until autorepeat
+ * started -- has reached Android as an ordinary key. Letting a later press
+ * complete a chord around it would emit the target on top of a key the user
+ * already produced. Such a chord is no longer formable.
+ *
+ * App-launch, shell and screenshot rules are exempt: their modifiers are
+ * deliberately forwarded, and they emit no target keys to contaminate.
+ */
+static bool chord_prefixes_not_forwarded(const MappingRule *rule,
+                                         const DeviceContext *device,
+                                         int trigger_key) {
+    for (size_t index = 0; index < rule->source_count; index++) {
+        int key = rule->source[index];
+        if (key == trigger_key) {
+            continue;
+        }
+        if (key >= 0 && key <= KEY_MAX && device->forwarded[key]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static int matching_rule(const Config *config, const DeviceContext *device, int trigger_key) {
     int selected = -1;
     size_t selected_size = 0;
@@ -1175,6 +1214,10 @@ static int matching_rule(const Config *config, const DeviceContext *device, int 
                 continue;
             }
             const MappingRule *rule = &config->rules[rule_index];
+            if (rule->action == RULE_ACTION_KEYS &&
+                !chord_prefixes_not_forwarded(rule, device, trigger_key)) {
+                continue;
+            }
             if (rule_is_complete(rule, device) && rule->source_count > selected_size) {
                 selected = (int)rule_index;
                 selected_size = rule->source_count;
@@ -1418,6 +1461,16 @@ static int handle_key_event(DeviceContext *device, const Config *config,
         if (rule >= 0) {
             return activate_rule(device, config, (size_t)rule, event);
         }
+        // This key only ever triggers a chord as its final key. No chord is
+        // complete, so its prefix keys are not held and it can no longer become
+        // part of one. Deliver the press immediately: deferring it to key-up is
+        // what made a key that also appears in a chord (Fn+1, for example)
+        // impossible to hold down or autorepeat.
+        if (config->key_action_trigger_sources[key]) {
+            device->forwarded[key] = true;
+            return transformed_key ? emit_key(device, event, key, 1)
+                                   : forward_event(device, event);
+        }
         if (!config->key_action_sources[key] && is_app_modifier_source(config, key)) {
             device->forwarded[key] = true;
             return forward_event(device, event);
@@ -1434,20 +1487,46 @@ static int handle_key_event(DeviceContext *device, const Config *config,
         if (!mapping_source && !transformed_key) {
             return forward_event(device, event);
         }
+        bool repeated_rule = false;
         for (size_t word_index = 0; word_index < RULE_INDEX_WORDS; word_index++) {
             uint64_t candidates = config->source_rules[key][word_index];
             while (candidates != 0) {
                 unsigned int bit = (unsigned int)__builtin_ctzll(candidates);
                 size_t rule_index = word_index * 64 + bit;
                 candidates &= candidates - 1;
-                if (rule_index < config->rule_count && device->active_rules[rule_index] &&
-                    config->rules[rule_index].action == RULE_ACTION_KEYS &&
-                    repeat_rule_target(device, &config->rules[rule_index], event) < 0) {
+                if (rule_index >= config->rule_count || !device->active_rules[rule_index] ||
+                    config->rules[rule_index].action != RULE_ACTION_KEYS) {
+                    continue;
+                }
+                if (repeat_rule_target(device, &config->rules[rule_index], event) < 0) {
                     return -1;
                 }
+                repeated_rule = true;
             }
         }
-        return mapping_source || transformed_key ? 0 : forward_event(device, event);
+        if (repeated_rule) {
+            return 0;
+        }
+        // A trigger key pressed without its chord -- and any key delivered by
+        // fast passthrough -- is really held down on the virtual keyboard now.
+        // Forward the hardware autorepeat instead of swallowing it.
+        if (device->forwarded[key]) {
+            return transformed_key ? emit_key(device, event, key, 2)
+                                   : forward_event(device, event);
+        }
+        // A printable prefix (A in A+B) waits for the chord's final key. Once
+        // the keyboard starts repeating it, the user is holding it as a normal
+        // key; publish the press now so it can repeat. Fn is a layer key and
+        // must stay silent.
+        if (device->pending[key] && !transformed_key && key != KEY_FN) {
+            device->pending[key] = false;
+            device->forwarded[key] = true;
+            if (emit_key(device, event, key, 1) < 0) {
+                return -1;
+            }
+            return forward_event(device, event);
+        }
+        return 0;
     }
 
     if (event->value == 0) {
@@ -1477,7 +1556,7 @@ static int handle_key_event(DeviceContext *device, const Config *config,
         }
         if (mapping_source && device->pending[key]) {
             device->pending[key] = false;
-            if (transformed_key) {
+            if (transformed_key || key == KEY_FN) {
                 return 0;
             }
             if (emit_key(device, event, key, 1) < 0) {
