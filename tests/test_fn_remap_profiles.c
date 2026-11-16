@@ -175,6 +175,24 @@ int main(void) {
     check(strcmp(profile, "方案一") == 0,
           "a request for a profile that is not defined is ignored");
 
+    // A stale active_profile= used to load zero rules while status still said
+    // "running". It must fall back to a profile that exists.
+    unlink(request_path);
+    write_text(config_path,
+               "version=1\n"
+               "device=auto\n"
+               "profile=方案一\n"
+               "mapping=KEY_A=>KEY_B\n"
+               "profile=方案二\n"
+               "mapping=KEY_C=>KEY_D\n"
+               "active_profile=已经删除的方案\n");
+    resolve_active_profile(profile, sizeof(profile));
+    check(strcmp(profile, "方案一") == 0,
+          "a stale active_profile falls back to the first defined profile");
+    load_config_profile(&config, profile);
+    check(has_rule(&config, KEY_A, KEY_B) && !has_rule(&config, KEY_C, KEY_D),
+          "the fallback loads real rules instead of an empty set");
+
     write_text(config_path,
                "version=1\n"
                "device=auto\n"

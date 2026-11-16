@@ -130,6 +130,68 @@ static void init_printable_prefix_config(Config *config) {
     index_config_keys(config);
 }
 
+static void test_reordered_sources(void) {
+    printf("\n-- source order --\n");
+    Config config;
+    memset(&config, 0, sizeof(config));
+    config.rule_count = 1;
+    MappingRule *rule = &config.rules[0];
+    rule->action = RULE_ACTION_KEYS;
+    // This is exactly what the old WebUI wrote for Ctrl+Tab: the select returns
+    // options in list order (Tab comes before Ctrl), not press order.
+    rule->source[0] = KEY_TAB;
+    rule->source[1] = KEY_LEFTCTRL;
+    rule->source_count = 2;
+    rule->target[0] = KEY_X;
+    rule->target_count = 1;
+    index_config_keys(&config);
+
+    check(config.rules[0].source[0] == KEY_LEFTCTRL &&
+          config.rules[0].source[1] == KEY_TAB,
+          "modifiers are moved in front of the trigger key");
+
+    TestDevice test = open_test_device();
+    struct input_event events[32];
+    check(send_key(&test, &config, KEY_LEFTCTRL, 1) == 0, "Ctrl press is accepted");
+    size_t count = read_events(&test, events, 32);
+    check(saw_key(events, count, KEY_LEFTCTRL, 1), "Ctrl is forwarded normally");
+    check(send_key(&test, &config, KEY_TAB, 1) == 0, "Tab press is accepted");
+    count = read_events(&test, events, 32);
+    check(saw_key(events, count, KEY_X, 1), "Ctrl+Tab triggers after Ctrl is forwarded");
+    check(saw_key(events, count, KEY_LEFTCTRL, 0),
+          "Ctrl is lifted before the Ctrl+Tab target");
+    close_test_device(&test);
+}
+
+static void test_transform_source(void) {
+    printf("\n-- transform source --\n");
+    Config config;
+    memset(&config, 0, sizeof(config));
+    config.fn_transform_sources[0] = KEY_F23;
+    config.fn_transform_count = 1;
+    config.rule_count = 1;
+    MappingRule *rule = &config.rules[0];
+    rule->action = RULE_ACTION_KEYS;
+    rule->source[0] = KEY_F23;
+    rule->source[1] = KEY_1;
+    rule->source_count = 2;
+    rule->target[0] = KEY_A;
+    rule->target_count = 1;
+    index_config_keys(&config);
+
+    check(config.rules[0].source[0] == KEY_FN &&
+          config.rules[0].source[1] == KEY_1,
+          "a transformed source is resolved to Fn");
+
+    TestDevice test = open_test_device();
+    struct input_event events[32];
+    check(send_key(&test, &config, KEY_F23, 1) == 0, "Fn press is accepted");
+    check(send_key(&test, &config, KEY_1, 1) == 0, "1 press is accepted");
+    size_t count = read_events(&test, events, 32);
+    check(saw_key(events, count, KEY_A, 1), "Fn+1 triggers with a transform source");
+    close_test_device(&test);
+}
+
 static void test_standalone_trigger(void) {
     printf("\n-- standalone trigger key --\n");
     Config config;
@@ -243,6 +305,33 @@ static void test_reverse_order(void) {
     close_test_device(&test);
 }
 
+static void test_modifier_passthrough(void) {
+    printf("\n-- modifier passthrough --\n");
+    Config config;
+    init_modifier_chord_config(&config);
+    TestDevice test = open_test_device();
+    struct input_event events[32];
+
+    check(send_key(&test, &config, KEY_LEFTCTRL, 1) == 0, "Ctrl press is accepted");
+    size_t count = read_events(&test, events, 32);
+    check(saw_key(events, count, KEY_LEFTCTRL, 1), "Ctrl reaches Android immediately");
+
+    check(send_key(&test, &config, KEY_C, 1) == 0, "C press is accepted");
+    count = read_events(&test, events, 32);
+    check(saw_key(events, count, KEY_C, 1), "Ctrl+C delivers C while Ctrl is held");
+
+    check(send_key(&test, &config, KEY_C, 0) == 0, "C release is accepted");
+    count = read_events(&test, events, 32);
+    check(saw_key(events, count, KEY_C, 0), "C release is forwarded");
+    check(!saw_key(events, count, KEY_LEFTCTRL, 0), "C release does not lift Ctrl");
+
+    check(send_key(&test, &config, KEY_LEFTCTRL, 0) == 0, "Ctrl release is accepted");
+    count = read_events(&test, events, 32);
+    check(saw_key(events, count, KEY_LEFTCTRL, 0), "Ctrl release is forwarded once");
+
+    close_test_device(&test);
+}
+
 static void test_modifier_chord(void) {
     printf("\n-- modifier chord --\n");
     Config config;
@@ -252,19 +341,22 @@ static void test_modifier_chord(void) {
 
     check(send_key(&test, &config, KEY_LEFTCTRL, 1) == 0, "Ctrl press is accepted");
     size_t count = read_events(&test, events, 32);
-    check(count == 0, "Ctrl prefix stays silent while held");
+    check(saw_key(events, count, KEY_LEFTCTRL, 1),
+          "Ctrl prefix reaches Android immediately");
 
     check(send_key(&test, &config, KEY_LEFTSHIFT, 1) == 0, "Shift press is accepted");
     count = read_events(&test, events, 32);
-    check(count == 0, "Shift prefix stays silent while held");
+    check(saw_key(events, count, KEY_LEFTSHIFT, 1),
+          "Shift prefix reaches Android immediately");
 
     check(send_key(&test, &config, KEY_Z, 1) == 0, "Z press is accepted");
     count = read_events(&test, events, 32);
     check(saw_key(events, count, KEY_C, 1), "Ctrl+Shift+Z emits C press");
-    check(!saw_key(events, count, KEY_LEFTCTRL, 1) &&
-          !saw_key(events, count, KEY_LEFTSHIFT, 1) &&
-          !saw_key(events, count, KEY_Z, 1),
-          "Ctrl+Shift+Z does not leak its source keys");
+    check(saw_key(events, count, KEY_LEFTCTRL, 0) &&
+          saw_key(events, count, KEY_LEFTSHIFT, 0),
+          "the forwarded modifiers are lifted before the target");
+    check(!saw_key(events, count, KEY_Z, 1),
+          "Ctrl+Shift+Z does not leak its final source key");
 
     check(send_key(&test, &config, KEY_Z, 2) == 0, "Z repeat is accepted");
     count = read_events(&test, events, 32);
@@ -273,14 +365,17 @@ static void test_modifier_chord(void) {
     check(send_key(&test, &config, KEY_Z, 0) == 0, "Z release is accepted");
     count = read_events(&test, events, 32);
     check(saw_key(events, count, KEY_C, 0), "Ctrl+Shift+Z releases C");
+    check(saw_key(events, count, KEY_LEFTSHIFT, 1) &&
+          saw_key(events, count, KEY_LEFTCTRL, 1),
+          "the physically held modifiers are restored after the target");
 
     check(send_key(&test, &config, KEY_LEFTSHIFT, 0) == 0, "Shift release is accepted");
     count = read_events(&test, events, 32);
-    check(count == 0, "Shift release stays silent");
+    check(saw_key(events, count, KEY_LEFTSHIFT, 0), "Shift release is forwarded");
 
     check(send_key(&test, &config, KEY_LEFTCTRL, 0) == 0, "Ctrl release is accepted");
     count = read_events(&test, events, 32);
-    check(count == 0, "Ctrl release stays silent");
+    check(saw_key(events, count, KEY_LEFTCTRL, 0), "Ctrl release is forwarded");
     check(test.device.target_refs[KEY_C] == 0, "the chord target is fully released");
 
     close_test_device(&test);
@@ -343,7 +438,10 @@ int main(void) {
     test_fn_chord();
     test_direct_fn_is_silent();
     test_reverse_order();
+    test_modifier_passthrough();
     test_modifier_chord();
+    test_reordered_sources();
+    test_transform_source();
     test_printable_prefix();
 
     printf("\n%s\n", failures == 0 ? "all checks passed" : "there were failures");

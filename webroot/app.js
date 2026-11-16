@@ -15,6 +15,7 @@ const DEFAULT_PROFILE = "默认";
 // The global prefix is a WebUI editing aid: new key-output combos get this key
 // prepended. The daemon still reads the prefix from each rule's source list.
 const DEFAULT_GLOBAL_PREFIX = "KEY_FN";
+const MAX_COMBO_KEYS = 8;
 // A combo that already starts from a modifier is a deliberate modifier chord,
 // not a layer chord. Do not silently add Fn (or any other layer) in front of it.
 const MODIFIER_PREFIX_KEYS = new Set([
@@ -170,17 +171,63 @@ function cloneRule(rule) {
 /**
  * Puts the global prefix first in a new key-output combo.
  *
- * Only the WebUI's rule creation uses this. The daemon keeps reading the real
- * prefix from each rule, so existing rules are never rewritten behind the
- * user's back. `enabled` is false for single-key rules and non-key actions;
- * a chord that already uses Ctrl/Shift/Alt/Meta is left alone even when it is
- * enabled.
- */function applyGlobalPrefix(source, enabled) {
-  if (!enabled || !state.prefix || source.includes(state.prefix) ||
+ * Only the WebUI's rule creation uses this. The daemon still reads the prefix
+ * from each rule, so the prefix is never a hidden runtime setting.
+ * `enabled` is false for single-key rules and non-key actions; a chord that
+ * already contains Ctrl/Shift/Alt/Meta is left alone because it is a
+ * deliberate modifier chord, and a combo already at the 8-key limit cannot
+ * take another key.
+ */
+function applyGlobalPrefix(source, enabled) {
+  if (!enabled || !globalPrefixAvailable() || source.includes(state.prefix) ||
+      source.length >= MAX_COMBO_KEYS ||
       source.some((code) => MODIFIER_PREFIX_KEYS.has(code))) {
     return [...source];
   }
   return [state.prefix, ...source];
+}
+
+/** Whether the configured prefix is safe to add on this keyboard/config. */
+function globalPrefixAvailable() {
+  return state.prefix === "KEY_FN" && transformSources(activeProfileObject()).size > 0;
+}
+
+function isPrefixSourceKey(code) {
+  return code === "KEY_FN" || MODIFIER_PREFIX_KEYS.has(code);
+}
+
+/**
+ * Moves the layer/modifier keys to the front, preserving the relative order of
+ * everything else. The daemon now triggers on the final source key, so this is
+ * what makes Ctrl+Tab (stored as Tab,Ctrl by the select's tree order) work.
+ */
+function orderedSourceKeys(source) {
+  const prefix = [];
+  const rest = [];
+  for (const code of source) {
+    (isPrefixSourceKey(code) ? prefix : rest).push(code);
+  }
+  return [...prefix, ...rest];
+}
+
+/**
+ * Applies the daemon's source transformations to a rule being saved:
+ * transform sources become Fn, duplicates disappear, and prefix keys move to
+ * the front. A single-key F23=>Fn rule is itself the transform and is left
+ * untouched.
+ */
+function canonicalizeSource(source, target, profile, excludeRule) {
+  if (source.length === 1 && Array.isArray(target) && target.length === 1 &&
+      target[0] === "KEY_FN") {
+    return [...source];
+  }
+  const transforms = transformSources(profile, excludeRule);
+  const normalized = [];
+  for (const code of source) {
+    const mapped = transforms.has(code) ? "KEY_FN" : code;
+    if (!normalized.includes(mapped)) normalized.push(mapped);
+  }
+  return orderedSourceKeys(normalized);
 }
 
 function profileNamed(name) {
@@ -373,9 +420,10 @@ function parseConfig(text) {
     }
     if (line.startsWith("prefix=")) {
       const value = line.slice(7).trim();
-      state.prefix = value === "" || value === "none"
-        ? ""
-        : (KEYS.some(([code]) => code === value) ? value : DEFAULT_GLOBAL_PREFIX);
+      // Only Fn has the layer semantics the prefix needs. Modifiers and typing
+      // keys would either poison normal typing or delay every normal key, so a
+      // legacy value is discarded rather than used to build dead rules.
+      state.prefix = value === "KEY_FN" ? "KEY_FN" : "";
       continue;
     }
     if (line === "device=auto") {
@@ -448,10 +496,28 @@ function parseConfig(text) {
   }
 
   state.profiles = [...sections].map(([name, rules]) => ({ name, rules }));
+  // Bring every loaded rule in line with the daemon: transform sources are
+  // resolved to Fn and layer/modifier keys move to the front, so the last chip
+  // shown is the key that actually triggers. A transform rule itself is left
+  // untouched, or F23=>Fn would become Fn=>Fn and stop being a transform.
+  state.profiles.forEach((profile) => {
+    profile.rules.forEach((rule) => {
+      if (rule.type === "keys" && rule.source.length === 1 &&
+          rule.target?.length === 1 && rule.target[0] === "KEY_FN") {
+        return;
+      }
+      rule.source = canonicalizeSource(rule.source,
+        rule.type === "keys" ? rule.target : undefined, profile);
+    });
+  });
   const fallback = state.profiles.some((profile) => profile.name === activeName)
     ? activeName
     : state.profiles[0].name;
   useProfile(fallback);
+  // A config with no F23=>Fn transform anywhere cannot use an Fn prefix at all.
+  if (state.prefix === "KEY_FN" && transformSources().size === 0) {
+    state.prefix = "";
+  }
 }
 
 function parseDevices(text) {
@@ -662,10 +728,12 @@ function switchProfile(name) {
  * would never complete. Keep them visible in the select but do not offer them
  * for new prefixes.
  */
-function transformSources() {
+function transformSources(profile, excludeRule) {
   const sources = new Set();
-  state.profiles.forEach((profile) => {
-    profile.rules.forEach((rule) => {
+  const profiles = profile ? [profile] : state.profiles;
+  profiles.forEach((entry) => {
+    entry.rules.forEach((rule) => {
+      if (rule === excludeRule) return;
       if (rule.type === "keys" && rule.source.length === 1 &&
           rule.target?.length === 1 && rule.target[0] === "KEY_FN") {
         sources.add(rule.source[0]);
@@ -675,19 +743,32 @@ function transformSources() {
   return sources;
 }
 
+function activeProfileObject() {
+  return state.profiles.find((profile) => profile.name === state.activeProfile) ||
+    state.profiles[0] || { name: state.activeProfile, rules: state.rules };
+}
+
 function renderPrefixSelect() {
   const select = $("#globalPrefix");
   if (!select) return;
-  const transforms = transformSources();
+  const anywhere = transformSources().size > 0;
+  const available = transformSources(activeProfileObject()).size > 0;
+  if (!anywhere) state.prefix = "";
   const options = ['<option value="">不自动添加</option>'];
-  KEYS.forEach(([code, label]) => {
-    const convertsToFn = transforms.has(code);
-    const disabled = convertsToFn && code !== state.prefix ? " disabled" : "";
-    const suffix = convertsToFn ? "（已转换为 Fn）" : "";
-    options.push(`<option value="${code}"${disabled}>${html(label)} (${code})${suffix}</option>`);
-  });
+  if (anywhere) {
+    const disabled = available || state.prefix === "KEY_FN" ? "" : " disabled";
+    options.push(`<option value="KEY_FN"${disabled}>Fn (KEY_FN)</option>`);
+  }
   select.innerHTML = options.join("");
   select.value = state.prefix || "";
+  const note = $("#prefixNote");
+  if (note) {
+    note.textContent = available
+      ? "新建不含修饰键的“按键输出”组合时自动加入 Fn；已有规则不变"
+      : anywhere
+        ? "当前方案没有 Fn 转换，Fn 前缀在本方案不可用"
+        : "未检测到 Fn 转换，Fn 前缀不可用";
+  }
 }
 
 function renderMappings() {
@@ -796,6 +877,19 @@ function chooseMappingPart(option) {
 
 function setSelectValues(element, values) {
   for (const option of element.options) option.selected = values.includes(option.value);
+}
+
+/**
+ * Moves the captured options to the end in capture order. A native multi-select
+ * returns selectedOptions in tree order, so without this the last key the user
+ * pressed would not be the last source key -- and therefore not the trigger.
+ */
+function prioritizeOptions(element, values) {
+  const options = new Map([...element.options].map((option) => [option.value, option]));
+  for (const value of values) {
+    const option = options.get(value);
+    if (option) element.append(option);
+  }
 }
 
 function setPanelCollapsed(panel, collapsed) {
@@ -1096,9 +1190,14 @@ async function captureKeys(selector) {
     ensureKeyOptions(select, captured);
     const values = state.editor.mode === "single" && selector === "#sourceKeys"
       ? captured.slice(0, 1)
-      : captured;
+      : captured.slice(0, MAX_COMBO_KEYS);
     setSelectValues(select, values);
-    setCaptureStatus(`已捕获：${values.map(keyLabel).join("、")}。确认后点击“加入规则”。`);
+    prioritizeOptions(select, values);
+    setSelectValues(select, values);
+    const truncated = captured.length > values.length
+      ? `（只保留前 ${values.length} 个，单个组合最多 ${MAX_COMBO_KEYS} 键）`
+      : "";
+    setCaptureStatus(`已捕获：${values.map(keyLabel).join("、")}${truncated}。确认后点击“加入规则”。`);
   } catch (error) {
     setCaptureStatus(`捕获失败：${error.message}`, true);
   } finally {
@@ -1122,6 +1221,10 @@ function saveDraftPart() {
     }
     if (state.editor.mode === "single" && source.length !== 1) {
       setNotice("单键只能选择一个输入键。", true);
+      return;
+    }
+    if (source.length > MAX_COMBO_KEYS) {
+      setNotice(`单个组合最多 ${MAX_COMBO_KEYS} 个输入键。`, true);
       return;
     }
     draft.sourceMode = state.editor.mode;
@@ -1162,6 +1265,10 @@ function saveDraftPart() {
       setNotice("请至少选择一个输出键。", true);
       return;
     }
+    if (target.length > MAX_COMBO_KEYS) {
+      setNotice(`单个组合最多 ${MAX_COMBO_KEYS} 个输出键。`, true);
+      return;
+    }
     draft.targetType = "keys";
     draft.target = target;
   }
@@ -1182,15 +1289,27 @@ function saveDraftRule() {
     setNotice("请先完成输入按键和功能选择。", true);
     return;
   }
-  const source = applyGlobalPrefix(draft.source,
-    draft.targetType === "keys" && draft.sourceMode === "combo");
+  const target = draft.targetType === "keys" ? orderedOutputKeys(draft.target) : undefined;
+  if (target && target.length > MAX_COMBO_KEYS) {
+    setNotice(`单个组合最多 ${MAX_COMBO_KEYS} 个输出键。`, true);
+    return;
+  }
+  const isFnTransform = Boolean(target && target.length === 1 && target[0] === "KEY_FN" &&
+    draft.source.length === 1);
+  const normalized = canonicalizeSource(draft.source, target, activeProfileObject());
+  const source = applyGlobalPrefix(normalized,
+    draft.targetType === "keys" && draft.sourceMode === "combo" && !isFnTransform);
+  if (source.length > MAX_COMBO_KEYS) {
+    setNotice(`单个组合最多 ${MAX_COMBO_KEYS} 个输入键，前缀键未添加。`, true);
+    return;
+  }
   const rule = draft.targetType === "app"
     ? { type: "app", source, component: draft.component, freeform: draft.freeform, closeOnRepeat: draft.closeOnRepeat }
     : draft.targetType === "shell"
       ? { type: "shell", source, shellCommand: draft.shellCommand.trim(), shellRunAsRoot: draft.shellRunAsRoot }
       : draft.targetType === "screenshot"
         ? { type: "screenshot", source, screenshotMode: draft.screenshotMode }
-      : { type: "keys", source, target: orderedOutputKeys(draft.target) };
+      : { type: "keys", source, target };
   state.rules.push(rule);
   state.mappingUi.draft = null;
   state.mappingUi.addOpen = false;
@@ -1205,15 +1324,20 @@ function saveRule() {
     saveDraftPart();
     return;
   }
-  const source = selectedOptions("#sourceKeys");
-  if (source.length === 0) {
+  const selectedSource = selectedOptions("#sourceKeys");
+  if (selectedSource.length === 0) {
     setNotice("请至少选择一个输入键。", true);
     return;
   }
-  if (state.editor.type === "keys" && state.editor.mode === "single" && source.length !== 1) {
+  if (state.editor.type === "keys" && state.editor.mode === "single" && selectedSource.length !== 1) {
     setNotice("单键映射只能选择一个输入键。", true);
     return;
   }
+  if (selectedSource.length > MAX_COMBO_KEYS) {
+    setNotice(`单个组合最多 ${MAX_COMBO_KEYS} 个输入键。`, true);
+    return;
+  }
+  const editingRule = state.editor.index === null ? null : state.rules[state.editor.index];
   let rule;
   if (state.editor.type === "app") {
     const component = $("#appTarget").value;
@@ -1221,7 +1345,7 @@ function saveRule() {
       setNotice("请选择要打开的应用。", true);
       return;
     }
-    rule = { type: "app", source, component, freeform: $("#appFreeform").checked, closeOnRepeat: $("#appCloseOnRepeat").checked };
+    rule = { type: "app", source: canonicalizeSource(selectedSource, undefined, activeProfileObject(), editingRule), component, freeform: $("#appFreeform").checked, closeOnRepeat: $("#appCloseOnRepeat").checked };
   } else if (state.editor.type === "shell") {
     const shellCommand = $("#shellCommand").value.trim();
     if (!shellCommand) {
@@ -1232,25 +1356,37 @@ function saveRule() {
       setNotice("Shell 命令过长，请控制在 640 字节以内。", true);
       return;
     }
-    rule = { type: "shell", source, shellCommand, shellRunAsRoot: $("#shellRunAsRoot").checked };
+    rule = { type: "shell", source: canonicalizeSource(selectedSource, undefined, activeProfileObject(), editingRule), shellCommand, shellRunAsRoot: $("#shellRunAsRoot").checked };
   } else if (state.editor.type === "screenshot") {
     if (!["normal", "long", "area"].includes(state.editor.pendingScreenshotMode)) {
       setNotice("请选择一个 ColorOS 截图功能。", true);
       return;
     }
-    rule = { type: "screenshot", source, screenshotMode: state.editor.pendingScreenshotMode };
+    rule = { type: "screenshot", source: canonicalizeSource(selectedSource, undefined, activeProfileObject(), editingRule), screenshotMode: state.editor.pendingScreenshotMode };
   } else {
     const target = orderedOutputKeys(selectedOptions("#targetKeys"));
     if (target.length === 0) {
       setNotice("请至少选择一个输出键。", true);
       return;
     }
+    if (target.length > MAX_COMBO_KEYS) {
+      setNotice(`单个组合最多 ${MAX_COMBO_KEYS} 个输出键。`, true);
+      return;
+    }
+    const isFnTransform = target.length === 1 && target[0] === "KEY_FN" &&
+      selectedSource.length === 1;
+    const normalized = canonicalizeSource(selectedSource, target, activeProfileObject(), editingRule);
     // Only a newly created combo gets the global prefix. Editing an existing
     // rule must not silently rewrite the sources the user already saved.
-    const keyComboSource = state.editor.index === null && state.editor.mode === "combo"
-      ? applyGlobalPrefix(source, true)
-      : source;
-    rule = { type: "keys", source: keyComboSource, target };
+    const source = state.editor.index === null && state.editor.mode === "combo" &&
+      !isFnTransform
+      ? applyGlobalPrefix(normalized, true)
+      : normalized;
+    if (source.length > MAX_COMBO_KEYS) {
+      setNotice(`单个组合最多 ${MAX_COMBO_KEYS} 个输入键，前缀键未添加。`, true);
+      return;
+    }
+    rule = { type: "keys", source, target };
   }
   if (state.editor.index === null) state.rules.push(rule);
   else state.rules[state.editor.index] = rule;
@@ -1414,7 +1550,7 @@ function saveConfig() {
 }
 
 async function restoreDefaults() {
-  const message = "恢复默认设置会清除当前设备选择、全局前缀键和全部自定义映射。是否继续？";
+  const message = "恢复默认设置会清除当前设备选择、全局前缀键和当前方案的自定义映射。是否继续？";
   if (!window.confirm(message)) return;
   state.auto = true;
   state.selected.clear();
@@ -1485,7 +1621,9 @@ $("#profileSelect").addEventListener("change", (event) => switchProfile(event.ta
 $("#globalPrefix").addEventListener("change", (event) => {
   state.prefix = event.target.value;
   setNotice(state.prefix
-    ? `全局前缀键已设为 ${keyLabel(state.prefix)}；新建“按键输出”组合会自动加入，保存并应用后生效。`
+    ? (globalPrefixAvailable()
+      ? `全局前缀键已设为 ${keyLabel(state.prefix)}；新建“按键输出”组合会自动加入，保存并应用后生效。`
+      : "已设为 Fn，但当前方案没有 Fn 转换，暂不会自动加入。")
     : "已关闭全局前缀键自动添加；保存并应用后生效。");
 });
 $("#saveConfig").addEventListener("click", saveConfig);

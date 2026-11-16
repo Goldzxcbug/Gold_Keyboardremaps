@@ -10,16 +10,26 @@ static int input_ioctl(int fd, unsigned long request, ...);
 #undef ioctl
 
 static unsigned char physical_keys[(KEY_MAX + 8) / 8];
+static bool declared_keys[KEY_MAX + 1];
 static bool fail_query;
 static int failures;
 static int input_ioctl(int fd, unsigned long request, ...) {
     (void)fd;
+    va_list args;
+    va_start(args, request);
+    if (request == UI_SET_KEYBIT) {
+        int key = va_arg(args, int);
+        if (key >= 0 && key <= KEY_MAX && !declared_keys[key]) {
+            declared_keys[key] = true;
+        }
+        va_end(args);
+        return 0;
+    }
     if (_IOC_TYPE(request) != 'E' || _IOC_NR(request) != 0x18 || fail_query) {
+        va_end(args);
         errno = EIO;
         return -1;
     }
-    va_list args;
-    va_start(args, request);
     void *bits = va_arg(args, void *);
     va_end(args);
     size_t size = _IOC_SIZE(request);
@@ -154,5 +164,13 @@ int main(void) {
     check(feed(&device, input[1], &mapped, reset, 2) < 0,
           "failed physical-state query recreates the device instead of guessing");
     close_pipes(input, output);
+
+    // The virtual keyboard must declare Fn: F23=>Fn is stored as a transform,
+    // not a rule, so the target enumeration would otherwise miss it.
+    memset(declared_keys, 0, sizeof(declared_keys));
+    check(declare_mapping_targets(123) == 0 && declared_keys[KEY_FN],
+          "the Fn transform target is declared on the virtual keyboard");
+    check(declared_keys[KEY_F1],
+          "ordinary mapping targets are still declared");
     return failures ? 1 : 0;
 }
