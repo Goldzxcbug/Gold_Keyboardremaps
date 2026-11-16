@@ -16,6 +16,7 @@ write_defaults() {
     mkdir -p "$MODDIR"
     {
         echo "version=1"
+        echo "prefix=KEY_FN"
         echo "device=auto"
         echo "mapping=KEY_F23=>KEY_FN"
         echo "mapping=KEY_FN+KEY_1=>KEY_F1"

@@ -1,5 +1,25 @@
 # 更新日志
 
+## 未发布修复（版本保持 1.1.1）
+
+### 修复
+
+- 修复 `mapping=` 规则里的修饰键导致 `Ctrl+C`、`Shift+A` 等正常输入失效的问题。修饰键按下时立即透传，组合触发时先松开已透传的修饰键再输出目标键，目标键释放后恢复仍按住的修饰键。
+- 修正组合键触发顺序：守护进程和 WebUI 都会把 `KEY_FN` 与 Ctrl/Shift/Alt/Meta 移到源键最前面，`Ctrl+Tab`、`Ctrl+Space`、`Alt+F4` 等不再因为下拉列表顺序变成以修饰键触发。
+- 保存规则时把转换源（如 `KEY_F23`）规范化为 `KEY_FN` 并去重，含 F23 的旧规则不再永远无法完成。
+- `active_profile=` 指向不存在的方案时回退到第一个已定义方案并写入日志，不再静默加载零条规则。
+- `declare_mapping_targets` 声明 `KEY_FN`，避免 Fn 转换输出被输入核心丢弃。
+- 手动选择键盘时，捕获和 `input-status claimed` 按设备标识匹配，不再依赖设备名启发式；`claimed` 也会排除虚拟键盘节点。
+- 配置中无效的 `mapping/launch/shell/screenshot/device` 行会带行号写入日志；Shell 命令恰好 640 字节不再被静默丢弃。
+- WebUI 全局前缀键只允许 Fn，且要求当前方案存在 Fn 转换；组合达到 8 键时不再自动加前缀。UI 增加源/目标键 8 键上限校验和捕获截断提示。
+- 修复 Shell 测试输出框的 `hidden` 被 CSS 覆盖；恢复默认设置的文案改为只清除当前方案。
+
+### 验证
+
+- `tests/test_fn_remap_repeat.c` 新增普通 Ctrl+C、修饰键组合、源键顺序和 F23 转换源测试。
+- `tests/test_fn_remap_profiles.c` 新增无效 `active_profile` 回退测试。
+- `tests/test_webui_config.js` 新增源键规范化、前缀安全、8 键上限和无转换测试。
+
 ## 1.1.1（2026-11-01）
 
 ### 修复

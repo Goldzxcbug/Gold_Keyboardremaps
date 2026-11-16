@@ -116,7 +116,7 @@ typedef struct {
     char component[256];
     bool launch_freeform;
     bool close_on_repeat;
-    char shell_command[MAX_SHELL_COMMAND];
+    char shell_command[MAX_SHELL_COMMAND + 1];
     bool shell_run_as_root;
     ScreenshotMode screenshot_mode;
 } MappingRule;
@@ -138,6 +138,10 @@ typedef struct {
     size_t rule_count;
     bool mapping_sources[KEY_MAX + 1];
     bool key_action_sources[KEY_MAX + 1];
+    // Only the final source of a key-action chord is a trigger. Earlier keys
+    // are the chord's prefix/layer keys: while they are held, the final key
+    // triggers the mapping; otherwise the final key stays an ordinary key.
+    bool key_action_trigger_sources[KEY_MAX + 1];
     bool app_modifier_sources[KEY_MAX + 1];
     bool app_trigger_sources[KEY_MAX + 1];
     uint64_t trigger_rules[KEY_MAX + 1][RULE_INDEX_WORDS];
@@ -160,6 +164,14 @@ typedef struct {
     bool ignore_until_up[KEY_MAX + 1];
     bool discarding_frame;
     bool active_rules[MAX_RULES];
+    // A modifiers-only chord cannot output its target without first lifting
+    // the modifiers Android has already seen. These hold the keys that were
+    // forwarded, then released for the duration of the target, so they can be
+    // pressed again when the target is released -- normal shortcuts keep
+    // working in between.
+    bool modifier_suspended[KEY_MAX + 1];
+    unsigned int modifier_suspend_refs[KEY_MAX + 1];
+    uint16_t rule_suspended_mods[MAX_RULES];
     unsigned int target_refs[KEY_MAX + 1];
     struct input_event output_batch[OUTPUT_BATCH_EVENTS];
     size_t output_batch_count;
@@ -169,6 +181,9 @@ typedef struct {
 static volatile sig_atomic_t keep_running = 1;
 
 static void index_config_keys(Config *config);
+static void canonicalize_config_rules(Config *config);
+static int canonical_key(const Config *config, int key);
+static bool is_modifier_key(int key);
 static int emit_key(DeviceContext *device, const struct input_event *original, int key, int value);
 static int flush_forwarded_events(DeviceContext *device);
 static int write_event(int fd, const struct input_event *event);
@@ -555,6 +570,7 @@ static bool parse_device_selector(Config *config, char *text) {
  * appears or disappears, so a switch costs no re-grab and no gap in forwarding.
  */
 static char g_active_profile[PROFILE_NAME_MAX];
+static bool g_profile_fallback_pending;
 
 static const char *profile_from_request_file(void) {
     return access(ANLAND_PROFILE_REQUEST, F_OK) == 0 ? ANLAND_PROFILE_NAME : NULL;
@@ -585,6 +601,7 @@ static bool config_has_profile(const char *profile) {
 // Which profile should be in force: Anland's request first, then whatever the
 // config nominates, then the implicit default that older configs use.
 static void resolve_active_profile(char *out, size_t out_size) {
+    g_profile_fallback_pending = false;
     const char *requested = profile_from_request_file();
     // Only honour the request if the profile exists. Switching to one that does
     // not would empty the rule set and silently stop every mapping the user has
@@ -595,24 +612,44 @@ static void resolve_active_profile(char *out, size_t out_size) {
         return;
     }
 
-    snprintf(out, out_size, "%s", DEFAULT_PROFILE_NAME);
+    char nominated[PROFILE_NAME_MAX] = "";
+    char first_profile[PROFILE_NAME_MAX] = "";
     FILE *file = fopen(CONFIG_PATH, "r");
-    if (file == NULL) {
+    if (file != NULL) {
+        char line[1200];
+        while (fgets(line, sizeof(line), file) != NULL) {
+            char *value = trim(line);
+            if (strncmp(value, "profile=", 8) == 0 && first_profile[0] == '\0') {
+                snprintf(first_profile, sizeof(first_profile), "%s", trim(value + 8));
+                continue;
+            }
+            if (strncmp(value, "active_profile=", 15) == 0 && nominated[0] == '\0') {
+                snprintf(nominated, sizeof(nominated), "%s", trim(value + 15));
+            }
+        }
+        fclose(file);
+    }
+
+    if (nominated[0] != '\0') {
+        if (config_has_profile(nominated)) {
+            snprintf(out, out_size, "%s", nominated);
+            return;
+        }
+        // A stale active_profile= used to load zero rules while status still
+        // reported "running". Fall back to a profile that exists and say so at
+        // the next actual load (resolve alone runs on every heartbeat).
+        g_profile_fallback_pending = true;
+        snprintf(out, out_size, "%s",
+                 first_profile[0] != '\0' ? first_profile : DEFAULT_PROFILE_NAME);
         return;
     }
-    char line[1200];
-    while (fgets(line, sizeof(line), file) != NULL) {
-        char *value = trim(line);
-        if (strncmp(value, "active_profile=", 15) != 0) {
-            continue;
-        }
-        char *name = trim(value + 15);
-        if (*name != '\0') {
-            snprintf(out, out_size, "%s", name);
-        }
-        break;
-    }
-    fclose(file);
+
+    snprintf(out, out_size, "%s", DEFAULT_PROFILE_NAME);
+}
+
+static void log_rejected_rule(size_t line_number, const char *kind, const char *rule) {
+    fprintf(stderr, "fn-remap: ignoring invalid %s on line %zu: %s\n", kind, line_number,
+            rule == NULL ? "" : rule);
 }
 
 static void load_config_profile(Config *config, const char *profile) {
@@ -631,7 +668,9 @@ static void load_config_profile(Config *config, const char *profile) {
     snprintf(section, sizeof(section), "%s", DEFAULT_PROFILE_NAME);
 
     char line[1200];
+    size_t line_number = 0;
     while (fgets(line, sizeof(line), file) != NULL) {
+        line_number++;
         char *value = trim(line);
         if (*value == '\0' || *value == '#') {
             continue;
@@ -647,8 +686,8 @@ static void load_config_profile(Config *config, const char *profile) {
             char *device = trim(value + 7);
             if (strcmp(device, "auto") == 0) {
                 config->auto_select = true;
-            } else {
-                (void)parse_device_selector(config, device);
+            } else if (!parse_device_selector(config, device)) {
+                log_rejected_rule(line_number, "device selector", device);
             }
             continue;
         }
@@ -659,13 +698,25 @@ static void load_config_profile(Config *config, const char *profile) {
             continue;
         }
         if (strncmp(value, "mapping=", 8) == 0) {
-            (void)add_mapping(config, trim(value + 8));
+            char *rule = trim(value + 8);
+            if (!add_mapping(config, rule)) {
+                log_rejected_rule(line_number, "mapping rule", rule);
+            }
         } else if (strncmp(value, "launch=", 7) == 0) {
-            (void)add_launch_rule(config, trim(value + 7));
+            char *rule = trim(value + 7);
+            if (!add_launch_rule(config, rule)) {
+                log_rejected_rule(line_number, "launch rule", rule);
+            }
         } else if (strncmp(value, "shell=", 6) == 0) {
-            (void)add_shell_rule(config, trim(value + 6));
+            char *rule = trim(value + 6);
+            if (!add_shell_rule(config, rule)) {
+                log_rejected_rule(line_number, "shell rule", rule);
+            }
         } else if (strncmp(value, "screenshot=", 11) == 0) {
-            (void)add_screenshot_rule(config, trim(value + 11));
+            char *rule = trim(value + 11);
+            if (!add_screenshot_rule(config, rule)) {
+                log_rejected_rule(line_number, "screenshot rule", rule);
+            }
         }
     }
     fclose(file);
@@ -679,8 +730,14 @@ static void load_config_profile(Config *config, const char *profile) {
 static void load_config(Config *config) {
     char profile[PROFILE_NAME_MAX];
     resolve_active_profile(profile, sizeof(profile));
+    if (g_profile_fallback_pending) {
+        fprintf(stderr, "fn-remap: configured active profile is missing; using '%s'\n", profile);
+        g_profile_fallback_pending = false;
+    }
     snprintf(g_active_profile, sizeof(g_active_profile), "%s", profile);
     load_config_profile(config, profile);
+    fprintf(stderr, "fn-remap: profile '%s' loaded with %zu rule(s)\n", profile,
+            config->rule_count);
 }
 
 // Whether the profile that should be in force is not the one loaded.
@@ -720,8 +777,11 @@ static int release_all_keys(DeviceContext *device) {
         device->pending[key] = false;
         device->suppressed[key] = false;
         device->forwarded[key] = false;
+        device->modifier_suspended[key] = false;
+        device->modifier_suspend_refs[key] = 0;
     }
     memset(device->active_rules, 0, sizeof(device->active_rules));
+    memset(device->rule_suspended_mods, 0, sizeof(device->rule_suspended_mods));
     if (released) {
         // Commit releases even if no further physical event follows a profile
         // switch. The exclusive Anland reader also waits for SYN_REPORT.
@@ -801,15 +861,15 @@ static bool matches_selector(const struct input_id *id, const DeviceSelector *se
 
 static bool is_capture_keyboard(const Config *config, int fd, const char *name,
                                 const struct input_id *id) {
-    if (!is_auto_keyboard(fd, name)) {
-        return false;
-    }
     if (config->auto_select) {
-        return true;
+        return is_auto_keyboard(fd, name);
     }
+    // An explicit selection is the user's decision. The name heuristic is only
+    // for auto mode: a Bluetooth keyboard called "MX Keys Mini" has no
+    // "keyboard" in its name, yet it must still be capturable once selected.
     for (size_t index = 0; index < config->selector_count; index++) {
         if (matches_selector(id, &config->selectors[index])) {
-            return true;
+            return has_key_events(fd);
         }
     }
     return false;
@@ -1015,6 +1075,13 @@ static int declare_mapping_targets(int fd) {
     // A NULL profile means "every section", so this collects the union.
     load_config_profile(all, NULL);
     int result = 0;
+    // A single-source mapping whose target is Fn becomes a transform, not a
+    // rule, so it is invisible to is_mapping_target(). The virtual device still
+    // has to declare Fn or the input core discards what the transform emits.
+    if (all->fn_transform_count > 0 && ioctl(fd, UI_SET_KEYBIT, KEY_FN) < 0) {
+        free(all);
+        return -1;
+    }
     for (int key = 0; key <= KEY_MAX && result == 0; key++) {
         if (!is_mapping_target(all, key)) {
             continue;
@@ -1102,6 +1169,7 @@ static bool is_modifier_key(int key) {
 }
 
 static void index_config_keys(Config *config) {
+    canonicalize_config_rules(config);
     for (size_t rule_index = 0; rule_index < config->rule_count; rule_index++) {
         const MappingRule *rule = &config->rules[rule_index];
         for (size_t key_index = 0; key_index < rule->source_count; key_index++) {
@@ -1113,7 +1181,15 @@ static void index_config_keys(Config *config) {
             config->source_rules[key][rule_index / 64] |= UINT64_C(1) << (rule_index % 64);
             if (rule->action == RULE_ACTION_KEYS) {
                 config->key_action_sources[key] = true;
-                config->trigger_rules[key][rule_index / 64] |= UINT64_C(1) << (rule_index % 64);
+                // A chord is completed by its final key. Earlier keys are
+                // prefixes and must not trigger on their own; otherwise a key
+                // like 1 in Fn+1 would be swallowed on press and could never
+                // repeat.
+                if (key_index + 1 == rule->source_count) {
+                    config->key_action_trigger_sources[key] = true;
+                    config->trigger_rules[key][rule_index / 64] |=
+                        UINT64_C(1) << (rule_index % 64);
+                }
             } else if (rule->action == RULE_ACTION_LAUNCH_APP ||
                        rule->action == RULE_ACTION_SHELL ||
                        rule->action == RULE_ACTION_SCREENSHOT) {
@@ -1153,9 +1229,95 @@ static int canonical_key(const Config *config, int key) {
     return key;
 }
 
+static bool is_prefix_source(int key) {
+    return is_modifier_key(key) || key == KEY_FN;
+}
+
+/*
+ * Make the source list match what the trigger semantics require.
+ *
+ * A chord is completed by its final source key, so every source that is a
+ * modifier or the Fn layer must come first: "Ctrl + Tab" has to be stored as
+ * Ctrl,Tab, never Tab,Ctrl. The web UI used to emit the latter because its
+ * select returns options in list order, not press order. Transforming sources
+ * (F23 -> Fn) are resolved here as well: a rule written against the raw code
+ * would otherwise wait forever for a pressed[F23] that canonical_key never
+ * sets.
+ *
+ * Order among the remaining non-prefix keys is preserved. It cannot be
+ * recovered from the config, so the UI also preserves capture order for those.
+ */
+static void canonicalize_config_rules(Config *config) {
+    for (size_t rule_index = 0; rule_index < config->rule_count; rule_index++) {
+        MappingRule *rule = &config->rules[rule_index];
+        int normalized[MAX_COMBO_KEYS];
+        size_t normalized_count = 0;
+        for (size_t index = 0; index < rule->source_count; index++) {
+            int key = canonical_key(config, rule->source[index]);
+            bool duplicate = false;
+            for (size_t seen = 0; seen < normalized_count; seen++) {
+                if (normalized[seen] == key) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                normalized[normalized_count++] = key;
+            }
+        }
+
+        int ordered[MAX_COMBO_KEYS];
+        size_t ordered_count = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            bool want_prefix = pass == 0;
+            for (size_t index = 0; index < normalized_count; index++) {
+                if (is_prefix_source(normalized[index]) == want_prefix) {
+                    ordered[ordered_count++] = normalized[index];
+                }
+            }
+        }
+        memcpy(rule->source, ordered, ordered_count * sizeof(ordered[0]));
+        rule->source_count = ordered_count;
+    }
+}
+
 static bool rule_is_complete(const MappingRule *rule, const DeviceContext *device) {
     for (size_t index = 0; index < rule->source_count; index++) {
         if (!device->pressed[rule->source[index]]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Whether every prefix of a key-action chord is still held for it.
+ *
+ * A key that has already been forwarded -- because its own press could not be
+ * part of a chord at that moment, or because it was held until autorepeat
+ * started -- has reached Android as an ordinary key. Letting a later press
+ * complete a chord around it would emit the target on top of a key the user
+ * already produced. Such a chord is no longer formable.
+ *
+ * App-launch, shell and screenshot rules are exempt: their modifiers are
+ * deliberately forwarded, and they emit no target keys to contaminate.
+ */
+static bool chord_prefixes_not_forwarded(const MappingRule *rule,
+                                         const DeviceContext *device,
+                                         int trigger_key) {
+    for (size_t index = 0; index < rule->source_count; index++) {
+        int key = rule->source[index];
+        if (key == trigger_key) {
+            continue;
+        }
+        // Modifiers are forwarded as soon as they are pressed so ordinary
+        // Ctrl+C / Shift+A keep working. A chord may still consume them: the
+        // forwarded press is lifted when the target is pressed and restored
+        // when it is released (see consume_rule_modifiers).
+        if (is_modifier_key(key)) {
+            continue;
+        }
+        if (key >= 0 && key <= KEY_MAX && device->forwarded[key]) {
             return false;
         }
     }
@@ -1175,6 +1337,10 @@ static int matching_rule(const Config *config, const DeviceContext *device, int 
                 continue;
             }
             const MappingRule *rule = &config->rules[rule_index];
+            if (rule->action == RULE_ACTION_KEYS &&
+                !chord_prefixes_not_forwarded(rule, device, trigger_key)) {
+                continue;
+            }
             if (rule_is_complete(rule, device) && rule->source_count > selected_size) {
                 selected = (int)rule_index;
                 selected_size = rule->source_count;
@@ -1367,13 +1533,80 @@ static int release_rule_target(DeviceContext *device, const MappingRule *rule,
     return 0;
 }
 
+static int consume_rule_modifiers(DeviceContext *device, const MappingRule *rule,
+                                  size_t rule_index, const struct input_event *event) {
+    for (size_t index = 0; index < rule->source_count; index++) {
+        int key = rule->source[index];
+        if (!is_modifier_key(key) || !device->forwarded[key]) {
+            continue;
+        }
+        if (!device->modifier_suspended[key]) {
+            // Android has already seen this modifier go down. Lift it for the
+            // target, then restore it when the target is released.
+            if (emit_key(device, event, key, 0) < 0) {
+                return -1;
+            }
+            device->modifier_suspended[key] = true;
+        }
+        device->modifier_suspend_refs[key]++;
+        device->rule_suspended_mods[rule_index] |= (uint16_t)(1u << index);
+    }
+    return 0;
+}
+
+static int restore_rule_modifiers(DeviceContext *device, const MappingRule *rule,
+                                  size_t rule_index, const struct input_event *event) {
+    uint16_t bits = device->rule_suspended_mods[rule_index];
+    device->rule_suspended_mods[rule_index] = 0;
+    for (size_t index = rule->source_count; index > 0; index--) {
+        size_t source_index = index - 1;
+        if ((bits & (uint16_t)(1u << source_index)) == 0) {
+            continue;
+        }
+        int key = rule->source[source_index];
+        if (device->modifier_suspend_refs[key] > 0) {
+            device->modifier_suspend_refs[key]--;
+        }
+        if (device->modifier_suspend_refs[key] != 0) {
+            continue;
+        }
+        // A physical release of this modifier is handled by the release path,
+        // which must not forward a second key-up for a key Android sees up.
+        if (!device->pressed[key]) {
+            continue;
+        }
+        device->modifier_suspended[key] = false;
+        if (!device->output_down[key] && emit_key(device, event, key, 1) < 0) {
+            return -1;
+        }
+        device->forwarded[key] = true;
+    }
+    return 0;
+}
+
+static int deactivate_rule(DeviceContext *device, const MappingRule *rule,
+                           size_t rule_index, const struct input_event *event) {
+    if (rule->action == RULE_ACTION_KEYS &&
+        release_rule_target(device, rule, event) < 0) {
+        return -1;
+    }
+    return restore_rule_modifiers(device, rule, rule_index, event);
+}
+
 static int activate_rule(DeviceContext *device, const Config *config, size_t rule_index,
                          const struct input_event *event) {
     const MappingRule *rule = &config->rules[rule_index];
+    bool key_action = rule->action == RULE_ACTION_KEYS;
     device->active_rules[rule_index] = true;
+    device->rule_suspended_mods[rule_index] = 0;
     for (size_t index = 0; index < rule->source_count; index++) {
         int key = rule->source[index];
         device->pending[key] = false;
+        if (key_action && is_modifier_key(key) && device->forwarded[key]) {
+            // consumed below, after every source's suppression is settled
+            device->suppressed[key] = false;
+            continue;
+        }
         device->suppressed[key] = !device->forwarded[key];
     }
     if (rule->action == RULE_ACTION_LAUNCH_APP) {
@@ -1387,6 +1620,9 @@ static int activate_rule(DeviceContext *device, const Config *config, size_t rul
     if (rule->action == RULE_ACTION_SCREENSHOT) {
         launch_rule_screenshot(rule);
         return 0;
+    }
+    if (consume_rule_modifiers(device, rule, rule_index, event) < 0) {
+        return -1;
     }
     return press_rule_target(device, rule, event);
 }
@@ -1418,6 +1654,29 @@ static int handle_key_event(DeviceContext *device, const Config *config,
         if (rule >= 0) {
             return activate_rule(device, config, (size_t)rule, event);
         }
+        // Modifiers are never deferred. Deferring them is what made a keys
+        // chord containing Ctrl/Shift/Alt poison normal typing: every Ctrl+C
+        // arrived as a bare c followed by a Ctrl tap on release. A chord can
+        // still consume them later; activate_rule lifts the forwarded press
+        // before emitting its target and restores it afterwards.
+        if (is_modifier_key(key)) {
+            device->pending[key] = false;
+            device->suppressed[key] = false;
+            device->modifier_suspended[key] = false;
+            device->forwarded[key] = true;
+            return transformed_key ? emit_key(device, event, key, 1)
+                                   : forward_event(device, event);
+        }
+        // This key only ever triggers a chord as its final key. No chord is
+        // complete, so its prefix keys are not held and it can no longer become
+        // part of one. Deliver the press immediately: deferring it to key-up is
+        // what made a key that also appears in a chord (Fn+1, for example)
+        // impossible to hold down or autorepeat.
+        if (config->key_action_trigger_sources[key]) {
+            device->forwarded[key] = true;
+            return transformed_key ? emit_key(device, event, key, 1)
+                                   : forward_event(device, event);
+        }
         if (!config->key_action_sources[key] && is_app_modifier_source(config, key)) {
             device->forwarded[key] = true;
             return forward_event(device, event);
@@ -1434,23 +1693,52 @@ static int handle_key_event(DeviceContext *device, const Config *config,
         if (!mapping_source && !transformed_key) {
             return forward_event(device, event);
         }
+        bool repeated_rule = false;
         for (size_t word_index = 0; word_index < RULE_INDEX_WORDS; word_index++) {
             uint64_t candidates = config->source_rules[key][word_index];
             while (candidates != 0) {
                 unsigned int bit = (unsigned int)__builtin_ctzll(candidates);
                 size_t rule_index = word_index * 64 + bit;
                 candidates &= candidates - 1;
-                if (rule_index < config->rule_count && device->active_rules[rule_index] &&
-                    config->rules[rule_index].action == RULE_ACTION_KEYS &&
-                    repeat_rule_target(device, &config->rules[rule_index], event) < 0) {
+                if (rule_index >= config->rule_count || !device->active_rules[rule_index] ||
+                    config->rules[rule_index].action != RULE_ACTION_KEYS) {
+                    continue;
+                }
+                if (repeat_rule_target(device, &config->rules[rule_index], event) < 0) {
                     return -1;
                 }
+                repeated_rule = true;
             }
         }
-        return mapping_source || transformed_key ? 0 : forward_event(device, event);
+        if (repeated_rule) {
+            return 0;
+        }
+        // A trigger key pressed without its chord -- and any key delivered by
+        // fast passthrough -- is really held down on the virtual keyboard now.
+        // Forward the hardware autorepeat instead of swallowing it.
+        if (device->forwarded[key]) {
+            return transformed_key ? emit_key(device, event, key, 2)
+                                   : forward_event(device, event);
+        }
+        // A printable prefix (A in A+B) waits for the chord's final key. Once
+        // the keyboard starts repeating it, the user is holding it as a normal
+        // key; publish the press now so it can repeat. Fn is a layer key and
+        // must stay silent.
+        if (device->pending[key] && !transformed_key && key != KEY_FN) {
+            device->pending[key] = false;
+            device->forwarded[key] = true;
+            if (emit_key(device, event, key, 1) < 0) {
+                return -1;
+            }
+            return forward_event(device, event);
+        }
+        return 0;
     }
 
     if (event->value == 0) {
+        // Clear the physical state before a rule is deactivated: restoring a
+        // modifier that is being released must not press it again.
+        device->pressed[key] = false;
         if (mapping_source) {
             for (size_t word_index = 0; word_index < RULE_INDEX_WORDS; word_index++) {
                 uint64_t candidates = config->source_rules[key][word_index];
@@ -1460,15 +1748,20 @@ static int handle_key_event(DeviceContext *device, const Config *config,
                     candidates &= candidates - 1;
                     if (rule_index < config->rule_count && device->active_rules[rule_index]) {
                         device->active_rules[rule_index] = false;
-                        if (config->rules[rule_index].action == RULE_ACTION_KEYS &&
-                            release_rule_target(device, &config->rules[rule_index], event) < 0) {
+                        if (deactivate_rule(device, &config->rules[rule_index], rule_index, event) < 0) {
                             return -1;
                         }
                     }
                 }
             }
         }
-        device->pressed[key] = false;
+        if (device->modifier_suspended[key]) {
+            // The press was already lifted for a chord target, and the target
+            // was released above. Android must not receive a second key-up.
+            device->modifier_suspended[key] = false;
+            device->forwarded[key] = false;
+            return 0;
+        }
         if (device->suppressed[key]) {
             device->suppressed[key] = false;
             device->pending[key] = false;
@@ -1477,7 +1770,7 @@ static int handle_key_event(DeviceContext *device, const Config *config,
         }
         if (mapping_source && device->pending[key]) {
             device->pending[key] = false;
-            if (transformed_key) {
+            if (transformed_key || key == KEY_FN) {
                 return 0;
             }
             if (emit_key(device, event, key, 1) < 0) {
@@ -1763,7 +2056,7 @@ static void find_default_device(DeviceContext devices[MAX_DEVICES], size_t *coun
 static char g_claimed[EVENT_SCAN_LIMIT][16];
 static size_t g_claimed_count;
 
-static void find_claimed_keyboards(void) {
+static void find_claimed_keyboards(const Config *config) {
     g_claimed_count = 0;
     for (int event_number = 0; event_number < EVENT_SCAN_LIMIT; event_number++) {
         char path[64];
@@ -1774,7 +2067,19 @@ static void find_claimed_keyboards(void) {
         if (fd < 0) {
             continue;
         }
-        bool keyboard = is_auto_keyboard(fd, name);
+        bool keyboard = false;
+        if (!is_virtual_name(name)) {
+            if (config->auto_select) {
+                keyboard = is_auto_keyboard(fd, name);
+            } else {
+                for (size_t index = 0; index < config->selector_count; index++) {
+                    if (matches_selector(&id, &config->selectors[index])) {
+                        keyboard = has_key_events(fd);
+                        break;
+                    }
+                }
+            }
+        }
         close(fd);
         if (!keyboard || g_claimed_count >= EVENT_SCAN_LIMIT) {
             continue;
@@ -2291,11 +2596,12 @@ int main(int argc, char **argv) {
 
     unsigned int retry_delay = RETRY_DELAY_INITIAL_SECONDS;
     while (keep_running) {
-        // Before anything is grabbed: this is what the snapshot claims, so it
-        // has to reflect the devices present now, not the ones from last cycle.
-        find_claimed_keyboards();
         Config config;
         load_config(&config);
+        // Before anything is grabbed: this is what the snapshot claims, so it
+        // has to reflect the devices present and the current selection now,
+        // not the ones from last cycle.
+        find_claimed_keyboards(&config);
         DeviceContext devices[MAX_DEVICES];
         memset(devices, 0, sizeof(devices));
         for (size_t index = 0; index < MAX_DEVICES; index++) {
