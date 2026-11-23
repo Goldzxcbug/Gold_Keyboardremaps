@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#f4f6f8">
   <title>Gold Keyboard Remaps</title>
-  <link rel="stylesheet" href="style.css?v=20260821-coloros-action-5">
+  <link rel="stylesheet" href="style.css?v=20261116-hotfix-4">
 </head>
 <body>
   <header class="topbar">
@@ -76,6 +76,12 @@
             <select id="profileSelect" aria-label="按键映射方案"></select>
             <span id="profileNote" class="profile-note"></span>
           </div>
+          <div class="profile-row prefix-row">
+            <label for="globalPrefix">全局前缀键</label>
+            <select id="globalPrefix" aria-label="全局前缀键" title="对所有方案生效；新建不含修饰键的“按键输出”组合时自动加入 Fn，已有规则不会被改动"></select>
+            <span id="prefixNote" class="profile-note">新建不含修饰键的“按键输出”组合时自动加入 Fn；已有规则不变</span>
+          </div>
+          <p class="mapping-hint mapping-behavior-hint">组合键以最后列出的键作为触发键，WebUI 会自动把 Fn、Ctrl、Shift、Alt 等前置键排到前面。单独按下最后一个键会立即作为普通键输出并支持长按重复；只按 Fn 时保持静默，只按 Ctrl/Shift/Alt 等前置键时会在松开或开始长按后作为普通键输出。</p>
           <p id="fnHint" class="mapping-hint" role="status"></p>
           <div id="mappingList" class="mapping-list"></div>
           <div id="emptyMappings" class="empty-state" hidden>暂无映射规则</div>
@@ -211,6 +217,6 @@
       </div>
     </footer>
   </main>
-  <script type="module" src="app.js?v=20260821-coloros-action-5"></script>
+  <script type="module" src="app.js?v=20261123-pr2-fix"></script>
 </body>
 </html>

@@ -113,12 +113,26 @@ check(migrated.includes('active_profile=方案一'),
   'the migrated file names its active profile');
 check(migrated.includes('profile=方案一'),
   'the migrated file writes sections');
+check(migrated.includes('prefix=none'),
+  'a config without an Fn transform writes no prefix instead of dead rules');
 
 // The daemon must still resolve the same rules after the migration: writing
 // active_profile=方案一 with the rules under profile=方案一 is only correct if
 // the two agree.
 check(ruleCount(migrated, '方案一') === 2,
   'reading the migrated file back finds the same rules');
+
+const implicitDefault = [
+  'active_profile=默认',
+  'mapping=KEY_A=>KEY_B',
+  'profile=方案一',
+  'mapping=KEY_A=>KEY_C',
+  'profile=默认',
+  'mapping=KEY_D=>KEY_E',
+].join('\n');
+check(activeProfile(implicitDefault) === '默认', 'the default profile stays selected');
+check(ruleCount(roundTrip(implicitDefault), '默认') === 2,
+  'the default profile keeps rules before and after its explicit header');
 
 // ---- sections survive a round trip ---------------------------------------
 
@@ -149,6 +163,20 @@ check(activeProfile(roundTripped) === '方案二', 'the active profile survives 
 check(roundTripped.includes('profile=方案三'),
   'the fixed profiles are written even when empty');
 
+// ---- the global prefix setting ------------------------------------------
+
+const prefixed = 'version=1\nprefix=KEY_LEFTALT\ndevice=auto\nmapping=KEY_A=>KEY_B\n';
+check(roundTrip(prefixed).includes('prefix=none'),
+  'an unsafe legacy prefix is discarded instead of creating broken rules');
+check(!roundTrip(prefixed).includes('prefix=KEY_LEFTALT'),
+  'a modifier is never written back as a global prefix');
+check(roundTrip('version=1\nprefix=none\ndevice=auto\nmapping=KEY_A=>KEY_B\n').includes('prefix=none'),
+  'an explicitly disabled global prefix stays disabled');
+check(ruleCount('version=1\nprefix=KEY_LEFTALT\nprofile=方案一\nmapping=KEY_A=>KEY_B\n', '方案一') === 1,
+  'the prefix line is not read as a mapping rule');
+check(roundTrip('version=1\ndevice=auto\nmapping=KEY_F23=>KEY_FN\n').includes('prefix=KEY_FN'),
+  'the default Fn prefix is kept when an Fn transform exists');
+
 // ---- the Anland profile --------------------------------------------------
 
 check(ruleCount(legacy, 'Anland') === 2,
@@ -169,6 +197,50 @@ vm.runInContext('useProfile("方案二"), state.rules.push({ type: "keys", sourc
 const edited = vm.runInContext('configText()', sandbox);
 check(ruleCount(edited, '方案二') === 3, 'a rule added while editing lands in the active profile');
 check(ruleCount(edited, '方案一') === 1, 'and does not leak into another profile');
+
+// ---- source normalisation -----------------------------------------------
+
+vm.runInContext(
+  'state.profiles = [{ name: "方案一", rules: [{ type: "keys", source: ["KEY_F23"], target: ["KEY_FN"] }] }]',
+  sandbox);
+check(vm.runInContext('canonicalizeSource(["KEY_TAB", "KEY_LEFTCTRL"], ["KEY_X"]).join("+")', sandbox) ===
+  'KEY_LEFTCTRL+KEY_TAB',
+  'a modifier is moved in front of the Ctrl+Tab trigger key');
+check(vm.runInContext('canonicalizeSource(["KEY_F23", "KEY_1"], ["KEY_A"]).join("+")', sandbox) ===
+  'KEY_FN+KEY_1',
+  'a transform source is resolved to Fn before ordering');
+check(vm.runInContext('canonicalizeSource(["KEY_F23"], ["KEY_FN"]).join("+")', sandbox) ===
+  'KEY_F23',
+  'the transform rule itself is not rewritten to Fn=>Fn');
+vm.runInContext('state.__transformRule = state.profiles[0].rules[0]', sandbox);
+check(vm.runInContext(
+  'canonicalizeSource(["KEY_F23"], ["KEY_A"], state.profiles[0], state.__transformRule).join("+")',
+  sandbox) === 'KEY_F23',
+  'editing a transform rule into a normal rule does not canonicalise away its own source');
+
+// ---- global prefix auto-completion --------------------------------------
+
+vm.runInContext('state.prefix = "KEY_FN"', sandbox);
+check(vm.runInContext('applyGlobalPrefix(["KEY_1"], true).join("+")', sandbox) === 'KEY_FN+KEY_1',
+  'the global prefix is prepended to a new key combo');
+check(vm.runInContext('applyGlobalPrefix(["KEY_FN", "KEY_1"], true).join("+")', sandbox) === 'KEY_FN+KEY_1',
+  'an existing prefix is not duplicated');
+check(vm.runInContext('applyGlobalPrefix(["KEY_1"], false).join("+")', sandbox) === 'KEY_1',
+  'single-key and non-key rules are not prefixed');
+check(vm.runInContext('applyGlobalPrefix(["KEY_LEFTCTRL", "KEY_Q"], true).join("+")', sandbox) === 'KEY_LEFTCTRL+KEY_Q',
+  'a deliberate modifier chord is left alone');
+check(vm.runInContext('applyGlobalPrefix(["KEY_FN","KEY_1","KEY_2","KEY_3","KEY_4","KEY_5","KEY_6","KEY_7"], true).length', sandbox) === 8,
+  'the prefix is not added when the combo already has eight keys');
+vm.runInContext('state.prefix = "KEY_LEFTALT"', sandbox);
+check(vm.runInContext('applyGlobalPrefix(["KEY_1"], true).join("+")', sandbox) === 'KEY_1',
+  'a modifier can never be used as a global prefix');
+vm.runInContext('state.profiles = [{ name: "方案一", rules: [{ type: "keys", source: ["KEY_A"], target: ["KEY_B"] }] }]', sandbox);
+vm.runInContext('state.prefix = "KEY_FN"', sandbox);
+check(vm.runInContext('applyGlobalPrefix(["KEY_1"], true).join("+")', sandbox) === 'KEY_1',
+  'Fn is not added when the config has no Fn transform');
+vm.runInContext('state.prefix = ""', sandbox);
+check(vm.runInContext('applyGlobalPrefix(["KEY_1"], true).join("+")', sandbox) === 'KEY_1',
+  'an empty global prefix adds nothing');
 
 console.log('\n' + (failures === 0 ? 'all checks passed' : 'there were failures'));
 process.exit(failures === 0 ? 0 : 1);
