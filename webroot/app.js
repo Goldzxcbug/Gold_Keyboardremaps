@@ -480,8 +480,9 @@ function parseConfig(text) {
     sections.set(MIGRATED_PROFILE, loose);
     loose = [];
     activeName = activeName || MIGRATED_PROFILE;
-  } else if (loose.length) {
-    sections.set(DEFAULT_PROFILE, loose);
+  } else if (loose.length || activeName === DEFAULT_PROFILE) {
+    sections.set(DEFAULT_PROFILE, [...loose, ...(sections.get(DEFAULT_PROFILE) || [])]);
+    if (loose.length && !activeName) activeName = DEFAULT_PROFILE;
   }
 
   FIXED_PROFILES.forEach((name) => {
@@ -880,9 +881,8 @@ function setSelectValues(element, values) {
 }
 
 /**
- * Moves the captured options to the end in capture order. A native multi-select
- * returns selectedOptions in tree order, so without this the last key the user
- * pressed would not be the last source key -- and therefore not the trigger.
+ * A native multi-select returns selectedOptions in tree order. Keep the
+ * captured or saved order so the last source key remains the trigger.
  */
 function prioritizeOptions(element, values) {
   const options = new Map([...element.options].map((option) => [option.value, option]));
@@ -1022,9 +1022,11 @@ function openEditor(mode, index = null, requestedType = "keys", draftPart = "") 
       : { source: draft?.source || [], target: draft?.target || [] });
   $("#sourceKeys").innerHTML = keyOptions();
   $("#targetKeys").innerHTML = keyOptions();
-  ensureKeyOptions($("#sourceKeys"), rule.source);
+  const sourceSelect = $("#sourceKeys");
+  ensureKeyOptions(sourceSelect, rule.source);
   ensureKeyOptions($("#targetKeys"), rule.target || []);
-  setSelectValues($("#sourceKeys"), rule.source);
+  prioritizeOptions(sourceSelect, rule.source);
+  setSelectValues(sourceSelect, rule.source);
   setSelectValues($("#targetKeys"), rule.target || []);
   const captureLabel = editorMode === "combo" ? "捕获组合 5 秒" : "捕获按键 5 秒";
   $("#captureSource").textContent = captureLabel;
@@ -1191,7 +1193,6 @@ async function captureKeys(selector) {
     const values = state.editor.mode === "single" && selector === "#sourceKeys"
       ? captured.slice(0, 1)
       : captured.slice(0, MAX_COMBO_KEYS);
-    setSelectValues(select, values);
     prioritizeOptions(select, values);
     setSelectValues(select, values);
     const truncated = captured.length > values.length

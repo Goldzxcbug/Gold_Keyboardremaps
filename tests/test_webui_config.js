@@ -122,6 +122,18 @@ check(migrated.includes('prefix=none'),
 check(ruleCount(migrated, '方案一') === 2,
   'reading the migrated file back finds the same rules');
 
+const implicitDefault = [
+  'active_profile=默认',
+  'mapping=KEY_A=>KEY_B',
+  'profile=方案一',
+  'mapping=KEY_A=>KEY_C',
+  'profile=默认',
+  'mapping=KEY_D=>KEY_E',
+].join('\n');
+check(activeProfile(implicitDefault) === '默认', 'the default profile stays selected');
+check(ruleCount(roundTrip(implicitDefault), '默认') === 2,
+  'the default profile keeps rules before and after its explicit header');
+
 // ---- sections survive a round trip ---------------------------------------
 
 const profiled = [

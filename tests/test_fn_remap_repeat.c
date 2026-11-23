@@ -357,10 +357,24 @@ static void test_modifier_chord(void) {
           "the forwarded modifiers are lifted before the target");
     check(!saw_key(events, count, KEY_Z, 1),
           "Ctrl+Shift+Z does not leak its final source key");
+    check(test.device.output_down[KEY_LEFTCTRL] && test.device.output_down[KEY_LEFTSHIFT],
+          "the modifiers are back down while Z is still held");
+
+    check(send_key(&test, &config, KEY_A, 1) == 0, "unrelated A press is accepted");
+    count = read_events(&test, events, 32);
+    check(count == 1 && saw_key(events, count, KEY_A, 1) &&
+          test.device.output_down[KEY_LEFTCTRL] && test.device.output_down[KEY_LEFTSHIFT],
+          "ordinary input keeps both modifiers while the mapped target is held");
+    check(send_key(&test, &config, KEY_A, 0) == 0, "unrelated A release is accepted");
+    (void)read_events(&test, events, 32);
 
     check(send_key(&test, &config, KEY_Z, 2) == 0, "Z repeat is accepted");
     count = read_events(&test, events, 32);
-    check(saw_key(events, count, KEY_C, 2), "Ctrl+Shift+Z repeats C");
+    check(count == 5 && events[0].code == KEY_LEFTCTRL && events[0].value == 0 &&
+          events[1].code == KEY_LEFTSHIFT && events[1].value == 0 &&
+          events[2].code == KEY_C && events[2].value == 2 &&
+          test.device.output_down[KEY_LEFTCTRL] && test.device.output_down[KEY_LEFTSHIFT],
+          "Ctrl+Shift+Z repeats C with the modifiers lifted and immediately restored");
 
     check(send_key(&test, &config, KEY_Z, 0) == 0, "Z release is accepted");
     count = read_events(&test, events, 32);
@@ -433,6 +447,64 @@ static void test_printable_prefix(void) {
     close_test_device(&held);
 }
 
+static void test_trigger_that_is_also_a_prefix(void) {
+    Config config = {0};
+    check(add_mapping(&config, "KEY_F23=>KEY_FN") &&
+          add_mapping(&config, "KEY_FN+KEY_1=>KEY_F1") &&
+          add_mapping(&config, "KEY_1+KEY_K=>KEY_ESC"), "overlapping rules parse");
+    index_config_keys(&config);
+    TestDevice test = open_test_device();
+    struct input_event events[32];
+
+    check(send_key(&test, &config, KEY_1, 1) == 0 &&
+          read_events(&test, events, 32) == 0, "1 waits for K even when it triggers Fn+1");
+    check(send_key(&test, &config, KEY_K, 1) == 0, "1+K press is accepted");
+    size_t count = read_events(&test, events, 32);
+    check(count == 1 && saw_key(events, count, KEY_ESC, 1), "1+K emits only Escape");
+    check(send_key(&test, &config, KEY_K, 0) == 0 &&
+          send_key(&test, &config, KEY_1, 0) == 0, "1+K release is accepted");
+    count = read_events(&test, events, 32);
+    check(count == 1 && saw_key(events, count, KEY_ESC, 0), "1+K releases only Escape");
+    close_test_device(&test);
+}
+
+static void test_fn_without_action_chord(void) {
+    Config config = {0};
+    check(add_mapping(&config, "KEY_F23=>KEY_FN") &&
+          add_launch_rule(&config, "KEY_LEFTCTRL+KEY_F23=>com.android.settings/.Settings|normal"),
+          "Ctrl+Fn launch rule parses");
+    index_config_keys(&config);
+    TestDevice test = open_test_device();
+    struct input_event events[32];
+
+    check(send_key(&test, &config, KEY_F23, 1) == 0 &&
+          send_key(&test, &config, KEY_F23, 0) == 0, "Fn tap without Ctrl is accepted");
+    size_t count = read_events(&test, events, 32);
+    check(count == 2 && events[0].code == KEY_FN && events[0].value == 1 &&
+          events[1].code == KEY_FN && events[1].value == 0,
+          "an unmatched action forwards both edges as Fn instead of leaving F23 held");
+    close_test_device(&test);
+}
+
+static void test_modifier_shared_with_target(void) {
+    Config config = {0};
+    check(add_mapping(&config, "KEY_J=>KEY_LEFTCTRL"), "Ctrl target rule parses");
+    index_config_keys(&config);
+    TestDevice test = open_test_device();
+    struct input_event events[32];
+
+    check(send_key(&test, &config, KEY_LEFTCTRL, 1) == 0 &&
+          send_key(&test, &config, KEY_J, 1) == 0 &&
+          send_key(&test, &config, KEY_J, 0) == 0, "mapped Ctrl overlaps physical Ctrl");
+    size_t count = read_events(&test, events, 32);
+    check(count == 1 && saw_key(events, count, KEY_LEFTCTRL, 1) &&
+          test.device.output_down[KEY_LEFTCTRL], "ending the mapping leaves physical Ctrl held");
+    check(send_key(&test, &config, KEY_LEFTCTRL, 0) == 0, "physical Ctrl release is accepted");
+    count = read_events(&test, events, 32);
+    check(count == 1 && saw_key(events, count, KEY_LEFTCTRL, 0), "last owner releases Ctrl");
+    close_test_device(&test);
+}
+
 int main(void) {
     test_standalone_trigger();
     test_fn_chord();
@@ -443,6 +515,9 @@ int main(void) {
     test_reordered_sources();
     test_transform_source();
     test_printable_prefix();
+    test_trigger_that_is_also_a_prefix();
+    test_fn_without_action_chord();
+    test_modifier_shared_with_target();
 
     printf("\n%s\n", failures == 0 ? "all checks passed" : "there were failures");
     return failures == 0 ? 0 : 1;

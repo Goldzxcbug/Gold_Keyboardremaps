@@ -196,6 +196,20 @@ int main(void) {
     write_text(config_path,
                "version=1\n"
                "device=auto\n"
+               "active_profile=默认\n"
+               "mapping=KEY_A=>KEY_B\n"
+               "profile=方案一\n"
+               "mapping=KEY_A=>KEY_C\n");
+    resolve_active_profile(profile, sizeof(profile));
+    check(strcmp(profile, DEFAULT_PROFILE_NAME) == 0 && !g_profile_fallback_pending,
+          "the implicit default profile remains selectable beside named profiles");
+    load_config_profile(&config, profile);
+    check(has_rule(&config, KEY_A, KEY_B) && !has_rule(&config, KEY_A, KEY_C),
+          "selecting the implicit default loads the loose rules");
+
+    write_text(config_path,
+               "version=1\n"
+               "device=auto\n"
                "profile=方案一\n"
                "profile=Anland\n"
                "mapping=KEY_E=>KEY_F\n"
