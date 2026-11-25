@@ -612,14 +612,13 @@ async function refreshApps(selectedComponent = $("#appTarget").value) {
 
 function deviceCategory(device) {
   const value = `${device.name} ${device.classes}`.toLowerCase();
+  const isBluetooth = device.bus.toLowerCase() === "0005" || /bluetooth|蓝牙/.test(value);
   if (/pencil|stylus|手写/.test(value)) return "手写笔";
   if (/touchpad|触摸板/.test(value)) return "触摸板";
   if (/touchpanel|touch screen|touchscreen|触摸屏|touch_mt/.test(value)) return "触摸屏";
-  if (device.bus.toLowerCase() === "0005" && /KEYBOARD/.test(device.classes) &&
-      !/consumer/i.test(value)) return "蓝牙键盘";
-  if (/bluetooth|蓝牙/.test(value) && /keyboard|键盘/.test(value)) return "蓝牙键盘";
+  if (/consumer control|consumer/.test(value)) return isBluetooth ? "蓝牙多媒体键" : "多媒体按键";
+  if (isBluetooth && /keyboard|keypad|kbd|键盘/.test(value)) return "蓝牙键盘";
   if (/keyboard|keypad|kbd|键盘/.test(value) && /external/.test(value)) return "物理键盘";
-  if (/consumer control|consumer/.test(value)) return "多媒体按键";
   if (/mouse|鼠标/.test(value)) return "鼠标";
   if (/switch|开关/.test(value)) return "系统开关";
   if (/keyboard|键盘/.test(value)) return "系统按键";
@@ -636,7 +635,37 @@ function isUnsupportedDevice(device) {
 }
 
 function isAutoKeyboard(device) {
-  return ["物理键盘", "蓝牙键盘", "多媒体按键"].includes(deviceCategory(device));
+  return ["物理键盘", "蓝牙键盘", "蓝牙多媒体键", "多媒体按键"].includes(deviceCategory(device));
+}
+
+// Track UI collapse state for 2-level device groups
+const deviceGroupOpenState = new Map();
+
+function groupDevices(devices) {
+  const groups = new Map();
+  for (const device of devices) {
+    // Unique hardware group key: bus + vendor + product
+    const groupKey = `${device.bus.toLowerCase()}|${device.vendor.toLowerCase()}|${device.product.toLowerCase()}`;
+    if (!groups.has(groupKey)) {
+      const isBluetooth = device.bus.toLowerCase() === "0005" || /bluetooth|蓝牙/i.test(`${device.name} ${device.classes}`);
+      const busName = isBluetooth ? "蓝牙" : (device.bus.toLowerCase() === "0019" ? "物理触点" : "物理/USB");
+      // Clean base name for group header
+      let groupName = device.name
+        .replace(/\b(Consumer Control|Touchpad|Mouse|Keyboard)\b/gi, "")
+        .replace(/[\s\-_]+/g, " ")
+        .trim();
+      if (!groupName) groupName = device.name;
+      groups.set(groupKey, {
+        key: groupKey,
+        name: groupName,
+        busName,
+        isBluetooth,
+        devices: []
+      });
+    }
+    groups.get(groupKey).devices.push(device);
+  }
+  return [...groups.values()];
 }
 
 function renderDevices() {
@@ -647,27 +676,78 @@ function renderDevices() {
     list.innerHTML = '<div class="empty-state">未发现可配置的输入节点</div>';
     return;
   }
-  const nameCounts = new Map();
-  state.devices.forEach((device) => nameCounts.set(device.name, (nameCounts.get(device.name) || 0) + 1));
-  const nameIndexes = new Map();
-  list.innerHTML = state.devices.map((device) => {
-    const index = (nameIndexes.get(device.name) || 0) + 1;
-    nameIndexes.set(device.name, index);
-    const suffix = nameCounts.get(device.name) > 1 ? `（节点 ${index}）` : "";
-    const unsupported = isUnsupportedDevice(device);
-    const autoSelected = state.auto && isAutoKeyboard(device);
-    const checked = autoSelected || (!state.auto && state.selected.has(device.id));
-    const disabled = state.auto || unsupported;
+
+  const groups = groupDevices(state.devices);
+
+  list.innerHTML = groups.map((group, groupIndex) => {
+    const supportedDevices = group.devices.filter((d) => !isUnsupportedDevice(d));
+    const allCount = supportedDevices.length;
+    let checkedCount = 0;
+
+    for (const d of supportedDevices) {
+      const isChecked = state.auto ? isAutoKeyboard(d) : state.selected.has(d.id);
+      if (isChecked) checkedCount++;
+    }
+
+    const allChecked = allCount > 0 && checkedCount === allCount;
+    const partialChecked = checkedCount > 0 && checkedCount < allCount;
+    // Default open if it contains checked devices or if previously opened
+    const isOpen = deviceGroupOpenState.has(group.key)
+      ? deviceGroupOpenState.get(group.key)
+      : (checkedCount > 0 || groupIndex === 0);
+
+    const subRowsHtml = group.devices.map((device) => {
+      const unsupported = isUnsupportedDevice(device);
+      const autoSelected = state.auto && isAutoKeyboard(device);
+      const checked = autoSelected || (!state.auto && state.selected.has(device.id));
+      const disabled = state.auto || unsupported;
+      return `
+      <label class="device-sub-row${unsupported ? " unsupported" : ""}">
+        <input type="checkbox" data-device-id="${html(device.id)}" data-group-key="${html(group.key)}" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}>
+        <span class="device-main">
+          <span class="device-title">
+            <span class="device-name">${html(device.name)}</span>
+            <span class="device-category">${html(deviceCategory(device))}</span>
+            ${unsupported ? '<span class="device-support">暂不支持</span>' : ""}
+          </span>
+          <span class="device-meta">${html(unsupported ? "触摸/指针类设备未接入按键引擎" : state.auto && isAutoKeyboard(device) ? "自动模式已接管" : deviceMeta(device))}</span>
+        </span>
+      </label>
+      `;
+    }).join("");
+
     return `
-    <label class="device-row${unsupported ? " unsupported" : ""}">
-      <input type="checkbox" data-device-id="${html(device.id)}" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}>
-      <span class="device-main">
-        <span class="device-title"><span class="device-name">${html(device.name)}${suffix}</span><span class="device-category">${html(deviceCategory(device))}</span>${unsupported ? '<span class="device-support">暂不支持</span>' : ""}</span>
-        <span class="device-meta">${html(unsupported ? "触摸类设备暂未接入映射引擎" : state.auto && isAutoKeyboard(device) ? "自动模式已选择" : deviceMeta(device))}</span>
-      </span>
-    </label>
-  `;
+    <div class="device-group${isOpen ? " is-open" : ""}" data-group-key="${html(group.key)}">
+      <div class="device-group-header">
+        <input type="checkbox" class="group-master-checkbox" data-group-key="${html(group.key)}"
+          ${allChecked ? "checked" : ""}
+          ${state.auto || allCount === 0 ? "disabled" : ""}
+          ${partialChecked ? 'data-indeterminate="true"' : ""}>
+        <span class="device-main group-toggle-trigger">
+          <span class="device-title">
+            <span class="device-name">${html(group.name)}</span>
+            <span class="device-category">${html(group.busName)}</span>
+            <span class="muted" style="font-size: 11px;">(${group.devices.length} 个子节点)</span>
+          </span>
+          <span class="device-meta">${state.auto ? "自动模式模式管理中" : (allChecked ? "已全选所有可用子节点" : (checkedCount > 0 ? `已选 ${checkedCount}/${allCount} 个可用子节点` : "未勾选此设备"))}</span>
+        </span>
+        <button type="button" class="device-group-toggle group-toggle-trigger" aria-label="展开或折叠">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="6 9 12 15 18 9"></polyline>
+          </svg>
+        </button>
+      </div>
+      <div class="device-sub-list">
+        ${subRowsHtml}
+      </div>
+    </div>
+    `;
   }).join("");
+
+  // Update indeterminate state on checkboxes
+  list.querySelectorAll('.group-master-checkbox[data-indeterminate="true"]').forEach((box) => {
+    box.indeterminate = true;
+  });
 }
 
 function chips(keys) {
@@ -1686,23 +1766,56 @@ $("#autoSelect").addEventListener("change", (event) => {
   state.auto = event.target.checked;
   renderDevices();
 });
+// Hierarchical device list interaction: accordion fold & master checkbox
+$("#deviceList").addEventListener("click", (event) => {
+  // 1. Toggle accordion collapse on group header click
+  const trigger = event.target.closest(".group-toggle-trigger");
+  if (trigger) {
+    const groupCard = trigger.closest(".device-group");
+    if (groupCard) {
+      const groupKey = groupCard.dataset.groupKey;
+      const isOpen = !groupCard.classList.contains("is-open");
+      groupCard.classList.toggle("is-open", isOpen);
+      deviceGroupOpenState.set(groupKey, isOpen);
+    }
+    return;
+  }
+});
+
 $("#deviceList").addEventListener("change", (event) => {
+  // 2. Group master checkbox (Select All / Unselect All for this hardware)
+  if (event.target.classList.contains("group-master-checkbox")) {
+    const groupKey = event.target.dataset.groupKey;
+    const shouldCheck = event.target.checked;
+    state.auto = false;
+    const [devBus, devVendor, devProduct] = groupKey.split("|");
+    const targetDevices = state.devices.filter((item) => {
+      const [_, itemBus, itemVendor, itemProduct] = item.id.split("|");
+      return itemBus.toLowerCase() === devBus &&
+             itemVendor.toLowerCase() === devVendor &&
+             itemProduct.toLowerCase() === devProduct &&
+             !isUnsupportedDevice(item);
+    });
+
+    if (shouldCheck) {
+      targetDevices.forEach((item) => state.selected.add(item.id));
+    } else {
+      targetDevices.forEach((item) => state.selected.delete(item.id));
+    }
+    renderDevices();
+    return;
+  }
+
+  // 3. Sub-device individual checkbox toggle
   const id = event.target.dataset.deviceId;
   if (!id) return;
   const device = state.devices.find((item) => item.id === id);
   if (!device || isUnsupportedDevice(device)) return;
   state.auto = false;
-  const [_, devBus, devVendor, devProduct] = id.split("|");
-  // Link companion endpoints (e.g. Consumer Control / Media keys) sharing the same hardware identity
-  const companionDevices = state.devices.filter((item) => {
-    const [itemPath, itemBus, itemVendor, itemProduct] = item.id.split("|");
-    return itemBus === devBus && itemVendor === devVendor && itemProduct === devProduct && !isUnsupportedDevice(item);
-  });
-
   if (event.target.checked) {
-    companionDevices.forEach((item) => state.selected.add(item.id));
+    state.selected.add(id);
   } else {
-    companionDevices.forEach((item) => state.selected.delete(item.id));
+    state.selected.delete(id);
   }
   renderDevices();
 });
