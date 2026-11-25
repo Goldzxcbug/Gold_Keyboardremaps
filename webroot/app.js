@@ -636,7 +636,7 @@ function isUnsupportedDevice(device) {
 }
 
 function isAutoKeyboard(device) {
-  return ["物理键盘", "蓝牙键盘"].includes(deviceCategory(device));
+  return ["物理键盘", "蓝牙键盘", "多媒体按键"].includes(deviceCategory(device));
 }
 
 function renderDevices() {
@@ -1563,6 +1563,29 @@ async function restoreDefaults() {
   await applyConfig($("#restoreDefaults"), "恢复中", "恢复默认", "默认设置已恢复，输入转发器已重新加载。");
 }
 
+let lastInputGeneration = null;
+
+async function checkDeviceHotplug() {
+  try {
+    const { stdout } = await exec(`${CONTROL} input-status`);
+    const line = stdout.trim();
+    const genMatch = line.match(/generation=(\d+)/);
+    if (genMatch) {
+      const currentGen = genMatch[1];
+      if (lastInputGeneration !== null && lastInputGeneration !== currentGen) {
+        lastInputGeneration = currentGen;
+        // Hotplug event detected from daemon inotify, auto refresh device list
+        const { stdout: devicesOut } = await exec(`${CONTROL} list`);
+        parseDevices(devicesOut);
+        renderDevices();
+        setNotice("检测到输入设备热插拔，节点列表已自动同步。");
+      } else {
+        lastInputGeneration = currentGen;
+      }
+    }
+  } catch (_) {}
+}
+
 async function refreshStatus() {
   try {
     const { stdout } = await exec(`${CONTROL} status`);
@@ -1574,6 +1597,7 @@ async function refreshStatus() {
     } else {
       setStatus("已停止", "error");
     }
+    await checkDeviceHotplug();
   } catch (error) {
     setStatus("不可用", "error");
     throw error;
@@ -1668,8 +1692,18 @@ $("#deviceList").addEventListener("change", (event) => {
   const device = state.devices.find((item) => item.id === id);
   if (!device || isUnsupportedDevice(device)) return;
   state.auto = false;
-  if (event.target.checked) state.selected.add(id);
-  else state.selected.delete(id);
+  const [_, devBus, devVendor, devProduct] = id.split("|");
+  // Link companion endpoints (e.g. Consumer Control / Media keys) sharing the same hardware identity
+  const companionDevices = state.devices.filter((item) => {
+    const [itemPath, itemBus, itemVendor, itemProduct] = item.id.split("|");
+    return itemBus === devBus && itemVendor === devVendor && itemProduct === devProduct && !isUnsupportedDevice(item);
+  });
+
+  if (event.target.checked) {
+    companionDevices.forEach((item) => state.selected.add(item.id));
+  } else {
+    companionDevices.forEach((item) => state.selected.delete(item.id));
+  }
   renderDevices();
 });
 $("#mappingList").addEventListener("click", (event) => {
