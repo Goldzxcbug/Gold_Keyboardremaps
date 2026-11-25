@@ -1,0 +1,397 @@
+﻿diff --git a/fn_remap.c b/fn_remap.c
+index f764dbb..921f332 100644
+--- a/fn_remap.c
++++ b/fn_remap.c
+@@ -14,6 +14,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/inotify.h>
+ #include <sys/ioctl.h>
+ #include <sys/resource.h>
+ #include <sys/types.h>
+@@ -775,17 +776,88 @@ static bool contains_text(const char *text, const char *needle) {
+     return strstr(lower, needle) != NULL;
+ }
+ 
+-static bool is_auto_keyboard(int fd, const char *name) {
+-    if (!has_key_events(fd)) {
++static bool is_pointing_device(int fd, const char *name) {
++    if (contains_text(name, "touch") || contains_text(name, "pencil") ||
++        contains_text(name, "stylus") || contains_text(name, "mouse") ||
++        contains_text(name, "trackball") || contains_text(name, "touchpad")) {
++        return true;
++    }
++    uint8_t prop_bits[(INPUT_PROP_MAX + 8) / 8] = {0};
++    if (ioctl(fd, EVIOCGPROP(sizeof(prop_bits)), prop_bits) >= 0) {
++        if (bit_is_set(prop_bits, INPUT_PROP_POINTER) ||
++            bit_is_set(prop_bits, INPUT_PROP_DIRECT)) {
++            return true;
++        }
++    }
++    uint8_t rel_bits[(REL_MAX + 8) / 8] = {0};
++    if (ioctl(fd, EVIOCGBIT(EV_REL, sizeof(rel_bits)), rel_bits) >= 0) {
++        if (bit_is_set(rel_bits, REL_X) || bit_is_set(rel_bits, REL_Y)) {
++            return true;
++        }
++    }
++    uint8_t abs_bits[(ABS_MAX + 8) / 8] = {0};
++    if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)), abs_bits) >= 0) {
++        if (bit_is_set(abs_bits, ABS_X) || bit_is_set(abs_bits, ABS_Y) ||
++            bit_is_set(abs_bits, ABS_MT_POSITION_X)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool is_alphanumeric_keyboard(int fd) {
++    uint8_t key_bits[(KEY_MAX + 8) / 8] = {0};
++    if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0) {
+         return false;
+     }
+-    if (contains_text(name, "touch") || contains_text(name, "pencil") ||
+-        contains_text(name, "stylus") || contains_text(name, "consumer") ||
+-        contains_text(name, "power") || contains_text(name, "volume")) {
++    return bit_is_set(key_bits, KEY_A) && bit_is_set(key_bits, KEY_Z) &&
++           bit_is_set(key_bits, KEY_SPACE) && bit_is_set(key_bits, KEY_ENTER);
++}
++
++static bool is_primary_keyboard(int fd, const char *name) {
++    if (!has_key_events(fd) || is_pointing_device(fd, name)) {
++        return false;
++    }
++    if (contains_text(name, "power") || contains_text(name, "volume") ||
++        contains_text(name, "consumer")) {
+         return false;
+     }
++    if (is_alphanumeric_keyboard(fd)) {
++        return true;
++    }
+     return contains_text(name, "keyboard") || contains_text(name, "keypad") ||
+-           contains_text(name, "kbd") || contains_text(name, "hid");
++           contains_text(name, "kbd");
++}
++
++static bool is_companion_endpoint(int fd, const char *name, const struct input_id *id,
++                                  const struct input_id *target_id) {
++    if (target_id->vendor == 0 || target_id->product == 0) {
++        return false;
++    }
++    if (id->bustype != target_id->bustype || id->vendor != target_id->vendor ||
++        id->product != target_id->product) {
++        return false;
++    }
++    if (!has_key_events(fd) || is_pointing_device(fd, name)) {
++        return false;
++    }
++    return true;
++}
++
++static bool is_auto_keyboard(int fd, const char *name) {
++    if (!has_key_events(fd) || is_pointing_device(fd, name)) {
++        return false;
++    }
++    if (contains_text(name, "power") || contains_text(name, "volume")) {
++        return false;
++    }
++    if (contains_text(name, "consumer")) {
++        return contains_text(name, "keyboard") || contains_text(name, "keypad") ||
++               contains_text(name, "kbd");
++    }
++    return is_alphanumeric_keyboard(fd) || contains_text(name, "keyboard") ||
++           contains_text(name, "keypad") || contains_text(name, "kbd") ||
++           contains_text(name, "hid");
+ }
+ 
+ static bool is_button_input_code(unsigned int code) {
+@@ -1704,29 +1776,34 @@ static void find_selected_devices(DeviceContext devices[MAX_DEVICES], size_t *co
+                 close(fd);
+                 continue;
+             }
++            if (is_pointing_device(fd, name)) {
++                close(fd);
++                continue;
++            }
+             (void)add_device(devices, count, fd, path, name, &id, false);
+-            break;
++            if (selector->path[0] != '\0') {
++                break;
++            }
+         }
+     }
+ }
+ 
+ /*
+- * Auto-selection scans twice.
+- *
+- * A keyboard that is offered over both a wired transport and Bluetooth exposes
+- * two nodes with the same vendor, product and name. Picking whichever has the
+- * lower event number is a coin toss decided by how the kernel happened to number
+- * them this boot -- and this daemon's own virtual keyboard shifts those numbers
+- * around, so the same tablet can pick a different node after a replug.
++ * Auto-selection scans twice:
++ * Pass 0: Physical (non-Bluetooth) transport.
++ * Pass 1: Bluetooth transport.
+  *
+- * The physically attached transport wins the first pass: a keyboard sitting on
+- * the dock is the one whose keys are being pressed, and it is the transport that
+- * does not depend on a radio link staying up. The second pass keeps working for
+- * keyboards that are only offered over Bluetooth.
++ * Once a primary keyboard is found on the winning transport, any companion
++ * non-pointer key endpoints sharing the same hardware identity (bus/vendor/product)
++ * are also captured as part of that keyboard group (e.g. Consumer Control).
+  */
+ static void find_default_device(DeviceContext devices[MAX_DEVICES], size_t *count) {
+     for (int pass = 0; pass < 2 && *count == 0; pass++) {
+         bool physical_only = (pass == 0);
++        struct input_id target_id = {0};
++        bool found_primary = false;
++
++        // Stage 1: Find the primary alphanumeric keyboard on the winning transport
+         for (int event_number = 0;
+              event_number < EVENT_SCAN_LIMIT && *count < MAX_DEVICES; event_number++) {
+             char path[64];
+@@ -1741,11 +1818,68 @@ static void find_default_device(DeviceContext devices[MAX_DEVICES], size_t *coun
+                 close(fd);
+                 continue;
+             }
+-            if (!is_auto_keyboard(fd, name)) {
++            if (!is_primary_keyboard(fd, name)) {
+                 close(fd);
+                 continue;
+             }
+-            (void)add_device(devices, count, fd, path, name, &id, true);
++            if (add_device(devices, count, fd, path, name, &id, true)) {
++                target_id = id;
++                found_primary = true;
++                break;
++            }
++        }
++
++        // Fallback: if no full alphanumeric keyboard was found, try any auto keyboard
++        if (!found_primary) {
++            for (int event_number = 0;
++                 event_number < EVENT_SCAN_LIMIT && *count < MAX_DEVICES; event_number++) {
++                char path[64];
++                char name[128];
++                struct input_id id;
++                snprintf(path, sizeof(path), "/dev/input/event%d", event_number);
++                int fd = open_source(path, name, sizeof(name), &id);
++                if (fd < 0) {
++                    continue;
++                }
++                if (physical_only && id.bustype == BUS_BLUETOOTH) {
++                    close(fd);
++                    continue;
++                }
++                if (!is_auto_keyboard(fd, name)) {
++                    close(fd);
++                    continue;
++                }
++                if (add_device(devices, count, fd, path, name, &id, true)) {
++                    target_id = id;
++                    found_primary = true;
++                    break;
++                }
++            }
++        }
++
++        // Stage 2: Companion grouping 鈥?grab all companion key endpoints sharing the
++        // same hardware identity (e.g. Consumer Control, System Control).
++        if (found_primary && target_id.vendor != 0 && target_id.product != 0) {
++            for (int event_number = 0;
++                 event_number < EVENT_SCAN_LIMIT && *count < MAX_DEVICES; event_number++) {
++                char path[64];
++                char name[128];
++                struct input_id id;
++                snprintf(path, sizeof(path), "/dev/input/event%d", event_number);
++                int fd = open_source(path, name, sizeof(name), &id);
++                if (fd < 0) {
++                    continue;
++                }
++                if (source_already_open(devices, *count, path)) {
++                    close(fd);
++                    continue;
++                }
++                if (!is_companion_endpoint(fd, name, &id, &target_id)) {
++                    close(fd);
++                    continue;
++                }
++                (void)add_device(devices, count, fd, path, name, &id, false);
++            }
+         }
+     }
+ }
+@@ -1765,6 +1899,26 @@ static size_t g_claimed_count;
+ 
+ static void find_claimed_keyboards(void) {
+     g_claimed_count = 0;
++    struct input_id primary_ids[MAX_DEVICES];
++    size_t primary_count = 0;
++
++    for (int event_number = 0; event_number < EVENT_SCAN_LIMIT; event_number++) {
++        char path[64];
++        char name[128];
++        struct input_id id;
++        snprintf(path, sizeof(path), "/dev/input/event%d", event_number);
++        int fd = open_source(path, name, sizeof(name), &id);
++        if (fd < 0) {
++            continue;
++        }
++        if (is_primary_keyboard(fd, name) || is_auto_keyboard(fd, name)) {
++            if (primary_count < MAX_DEVICES && id.vendor != 0 && id.product != 0) {
++                primary_ids[primary_count++] = id;
++            }
++        }
++        close(fd);
++    }
++
+     for (int event_number = 0; event_number < EVENT_SCAN_LIMIT; event_number++) {
+         char path[64];
+         char name[128];
+@@ -1774,9 +1928,17 @@ static void find_claimed_keyboards(void) {
+         if (fd < 0) {
+             continue;
+         }
+-        bool keyboard = is_auto_keyboard(fd, name);
++        bool claim = is_auto_keyboard(fd, name);
++        if (!claim) {
++            for (size_t index = 0; index < primary_count; index++) {
++                if (is_companion_endpoint(fd, name, &id, &primary_ids[index])) {
++                    claim = true;
++                    break;
++                }
++            }
++        }
+         close(fd);
+-        if (!keyboard || g_claimed_count >= EVENT_SCAN_LIMIT) {
++        if (!claim || g_claimed_count >= EVENT_SCAN_LIMIT) {
+             continue;
+         }
+         snprintf(g_claimed[g_claimed_count], sizeof(g_claimed[0]), "event%d", event_number);
+@@ -2195,7 +2357,17 @@ static void status_sleep(unsigned int seconds, const DeviceContext *devices, siz
+ 
+ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Config *config,
+                            unsigned int *retry_delay) {
+-    struct pollfd fds[MAX_DEVICES * 2];
++    int inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
++    if (inotify_fd >= 0) {
++        if (inotify_add_watch(inotify_fd, "/dev/input", IN_CREATE | IN_DELETE) < 0) {
++            close(inotify_fd);
++            inotify_fd = -1;
++        }
++    }
++
++    struct pollfd fds[MAX_DEVICES * 2 + 1];
++    int result = 0;
++
+     while (keep_running) {
+         // Driven by elapsed time, never by "poll timed out": a keyboard that is
+         // being typed on keeps poll() returning events forever, and the snapshot
+@@ -2209,7 +2381,8 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Con
+             if (profile_switch_pending()) {
+                 for (size_t index = 0; index < count; index++) {
+                     if (release_all_keys(&devices[index]) < 0) {
+-                        return -1;
++                        result = -1;
++                        goto cleanup;
+                     }
+                 }
+                 char profile[PROFILE_NAME_MAX];
+@@ -2224,25 +2397,71 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Con
+             fds[fd_count++] = (struct pollfd){.fd = devices[index].source_fd, .events = POLLIN};
+             fds[fd_count++] = (struct pollfd){.fd = devices[index].virtual_fd, .events = POLLIN};
+         }
++        int inotify_index = -1;
++        if (inotify_fd >= 0) {
++            inotify_index = (int)fd_count;
++            fds[fd_count++] = (struct pollfd){.fd = inotify_fd, .events = POLLIN};
++        }
++
+         int ready = poll(fds, fd_count, 1000);
+         if (ready < 0) {
+             if (errno == EINTR) {
+                 continue;
+             }
+-            return -1;
++            result = -1;
++            goto cleanup;
+         }
+         for (size_t index = 0; index < count; index++) {
+             struct pollfd *source = &fds[index * 2];
+             struct pollfd *virtual = &fds[index * 2 + 1];
+             if (source->revents & (POLLERR | POLLHUP | POLLNVAL) ||
+                 virtual->revents & (POLLERR | POLLHUP | POLLNVAL)) {
+-                return -1;
++                result = -1;
++                goto cleanup;
+             }
+         }
++
++        // Process event-driven hotplug notifications from /dev/input
++        if (inotify_index >= 0 && (fds[inotify_index].revents & POLLIN)) {
++            char buffer[512] __attribute__((aligned(__alignof__(struct inotify_event))));
++            bool device_change_relevant = false;
++            ssize_t bytes_read;
++            while ((bytes_read = read(inotify_fd, buffer, sizeof(buffer))) > 0) {
++                const struct inotify_event *event;
++                for (char *ptr = buffer; ptr < buffer + bytes_read;
++                     ptr += sizeof(struct inotify_event) + event->len) {
++                    event = (const struct inotify_event *)ptr;
++                    if (event->len > 0 && strncmp(event->name, "event", 5) == 0) {
++                        char path[64];
++                        snprintf(path, sizeof(path), "/dev/input/%s", event->name);
++                        char dev_name[128];
++                        struct input_id dev_id;
++                        int dev_fd = open_source(path, dev_name, sizeof(dev_name), &dev_id);
++                        if (dev_fd >= 0) {
++                            if (!is_pointing_device(dev_fd, dev_name) &&
++                                (is_primary_keyboard(dev_fd, dev_name) ||
++                                 is_auto_keyboard(dev_fd, dev_name))) {
++                                device_change_relevant = true;
++                            }
++                            close(dev_fd);
++                        } else if (event->mask & IN_DELETE) {
++                            device_change_relevant = true;
++                        }
++                    }
++                }
++            }
++            if (device_change_relevant) {
++                fprintf(stderr, "fn-remap: input device hotplug detected via inotify\n");
++                result = 0;
++                goto cleanup;
++            }
++        }
++
+         for (size_t index = 0; index < count; index++) {
+             struct pollfd *source = &fds[index * 2];
+             if ((source->revents & POLLIN) && handle_source(&devices[index], config) < 0) {
+-                return -1;
++                result = -1;
++                goto cleanup;
+             }
+             if (source->revents & POLLIN) {
+                 // A real input event means this device has recovered; the next failure can
+@@ -2253,11 +2472,17 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Con
+         for (size_t index = 0; index < count; index++) {
+             struct pollfd *virtual = &fds[index * 2 + 1];
+             if ((virtual->revents & POLLIN) && handle_virtual_output(&devices[index]) < 0) {
+-                return -1;
++                result = -1;
++                goto cleanup;
+             }
+         }
+     }
+-    return 0;
++
++cleanup:
++    if (inotify_fd >= 0) {
++        close(inotify_fd);
++    }
++    return result;
+ }
+ 
+ int main(int argc, char **argv) {
+

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/types.h>
@@ -821,17 +822,73 @@ static bool contains_text(const char *text, const char *needle) {
     return strstr(lower, needle) != NULL;
 }
 
-static bool is_auto_keyboard(int fd, const char *name) {
-    if (!has_key_events(fd)) {
+static bool is_pointing_device(int fd, const char *name) {
+    if (contains_text(name, "touch") || contains_text(name, "pencil") ||
+        contains_text(name, "stylus") || contains_text(name, "mouse") ||
+        contains_text(name, "trackball") || contains_text(name, "touchpad")) {
+        return true;
+    }
+    uint8_t prop_bits[(INPUT_PROP_MAX + 8) / 8] = {0};
+    if (ioctl(fd, EVIOCGPROP(sizeof(prop_bits)), prop_bits) >= 0) {
+        if (bit_is_set(prop_bits, INPUT_PROP_POINTER) ||
+            bit_is_set(prop_bits, INPUT_PROP_DIRECT)) {
+            return true;
+        }
+    }
+    uint8_t rel_bits[(REL_MAX + 8) / 8] = {0};
+    if (ioctl(fd, EVIOCGBIT(EV_REL, sizeof(rel_bits)), rel_bits) >= 0) {
+        if (bit_is_set(rel_bits, REL_X) || bit_is_set(rel_bits, REL_Y)) {
+            return true;
+        }
+    }
+    uint8_t abs_bits[(ABS_MAX + 8) / 8] = {0};
+    if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)), abs_bits) >= 0) {
+        if (bit_is_set(abs_bits, ABS_X) || bit_is_set(abs_bits, ABS_Y) ||
+            bit_is_set(abs_bits, ABS_MT_POSITION_X)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_alphanumeric_keyboard(int fd) {
+    uint8_t key_bits[(KEY_MAX + 8) / 8] = {0};
+    if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0) {
         return false;
     }
-    if (contains_text(name, "touch") || contains_text(name, "pencil") ||
-        contains_text(name, "stylus") || contains_text(name, "consumer") ||
-        contains_text(name, "power") || contains_text(name, "volume")) {
+    return bit_is_set(key_bits, KEY_A) && bit_is_set(key_bits, KEY_Z) &&
+           bit_is_set(key_bits, KEY_SPACE) && bit_is_set(key_bits, KEY_ENTER);
+}
+
+static bool is_primary_keyboard(int fd, const char *name) {
+    if (!has_key_events(fd) || is_pointing_device(fd, name)) {
         return false;
+    }
+    if (contains_text(name, "power") || contains_text(name, "volume") ||
+        contains_text(name, "consumer")) {
+        return false;
+    }
+    if (is_alphanumeric_keyboard(fd)) {
+        return true;
     }
     return contains_text(name, "keyboard") || contains_text(name, "keypad") ||
-           contains_text(name, "kbd") || contains_text(name, "hid");
+           contains_text(name, "kbd");
+}
+
+static bool is_auto_keyboard(int fd, const char *name) {
+    if (!has_key_events(fd) || is_pointing_device(fd, name)) {
+        return false;
+    }
+    if (contains_text(name, "power") || contains_text(name, "volume")) {
+        return false;
+    }
+    if (contains_text(name, "consumer")) {
+        return contains_text(name, "keyboard") || contains_text(name, "keypad") ||
+               contains_text(name, "kbd");
+    }
+    return is_alphanumeric_keyboard(fd) || contains_text(name, "keyboard") ||
+           contains_text(name, "keypad") || contains_text(name, "kbd") ||
+           contains_text(name, "hid");
 }
 
 static bool is_button_input_code(unsigned int code) {
@@ -2468,7 +2525,17 @@ static void status_sleep(unsigned int seconds, const DeviceContext *devices, siz
 
 static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Config *config,
                            unsigned int *retry_delay) {
-    struct pollfd fds[MAX_DEVICES * 2];
+    int inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (inotify_fd >= 0) {
+        if (inotify_add_watch(inotify_fd, "/dev/input", IN_CREATE | IN_DELETE) < 0) {
+            close(inotify_fd);
+            inotify_fd = -1;
+        }
+    }
+
+    struct pollfd fds[MAX_DEVICES * 2 + 1];
+    int result = 0;
+
     while (keep_running) {
         // Driven by elapsed time, never by "poll timed out": a keyboard that is
         // being typed on keeps poll() returning events forever, and the snapshot
@@ -2482,7 +2549,8 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Con
             if (profile_switch_pending()) {
                 for (size_t index = 0; index < count; index++) {
                     if (release_all_keys(&devices[index]) < 0) {
-                        return -1;
+                        result = -1;
+                        goto cleanup;
                     }
                 }
                 char profile[PROFILE_NAME_MAX];
@@ -2497,25 +2565,71 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Con
             fds[fd_count++] = (struct pollfd){.fd = devices[index].source_fd, .events = POLLIN};
             fds[fd_count++] = (struct pollfd){.fd = devices[index].virtual_fd, .events = POLLIN};
         }
+        int inotify_index = -1;
+        if (inotify_fd >= 0) {
+            inotify_index = (int)fd_count;
+            fds[fd_count++] = (struct pollfd){.fd = inotify_fd, .events = POLLIN};
+        }
+
         int ready = poll(fds, fd_count, 1000);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            return -1;
+            result = -1;
+            goto cleanup;
         }
         for (size_t index = 0; index < count; index++) {
             struct pollfd *source = &fds[index * 2];
             struct pollfd *virtual = &fds[index * 2 + 1];
             if (source->revents & (POLLERR | POLLHUP | POLLNVAL) ||
                 virtual->revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                return -1;
+                result = -1;
+                goto cleanup;
             }
         }
+
+        // Process event-driven hotplug notifications from /dev/input
+        if (inotify_index >= 0 && (fds[inotify_index].revents & POLLIN)) {
+            char buffer[512] __attribute__((aligned(__alignof__(struct inotify_event))));
+            bool device_change_relevant = false;
+            ssize_t bytes_read;
+            while ((bytes_read = read(inotify_fd, buffer, sizeof(buffer))) > 0) {
+                const struct inotify_event *event;
+                for (char *ptr = buffer; ptr < buffer + bytes_read;
+                     ptr += sizeof(struct inotify_event) + event->len) {
+                    event = (const struct inotify_event *)ptr;
+                    if (event->len > 0 && strncmp(event->name, "event", 5) == 0) {
+                        char path[64];
+                        snprintf(path, sizeof(path), "/dev/input/%s", event->name);
+                        char dev_name[128];
+                        struct input_id dev_id;
+                        int dev_fd = open_source(path, O_RDONLY, dev_name, sizeof(dev_name), &dev_id);
+                        if (dev_fd >= 0) {
+                            if (!is_pointing_device(dev_fd, dev_name) &&
+                                (is_primary_keyboard(dev_fd, dev_name) ||
+                                 is_auto_keyboard(dev_fd, dev_name))) {
+                                device_change_relevant = true;
+                            }
+                            close(dev_fd);
+                        } else if (event->mask & IN_DELETE) {
+                            device_change_relevant = true;
+                        }
+                    }
+                }
+            }
+            if (device_change_relevant) {
+                fprintf(stderr, "fn-remap: input device hotplug detected via inotify\n");
+                result = 0;
+                goto cleanup;
+            }
+        }
+
         for (size_t index = 0; index < count; index++) {
             struct pollfd *source = &fds[index * 2];
             if ((source->revents & POLLIN) && handle_source(&devices[index], config) < 0) {
-                return -1;
+                result = -1;
+                goto cleanup;
             }
             if (source->revents & POLLIN) {
                 // A real input event means this device has recovered; the next failure can
@@ -2526,11 +2640,18 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Con
         for (size_t index = 0; index < count; index++) {
             struct pollfd *virtual = &fds[index * 2 + 1];
             if ((virtual->revents & POLLIN) && handle_virtual_output(&devices[index]) < 0) {
-                return -1;
+                result = -1;
+                goto cleanup;
             }
         }
     }
-    return 0;
+    result = 0;
+
+cleanup:
+    if (inotify_fd >= 0) {
+        close(inotify_fd);
+    }
+    return result;
 }
 
 int main(int argc, char **argv) {
