@@ -237,6 +237,54 @@ int main(void) {
     check(strcmp(count, "1") == 0, "claimed is independent of what is held");
     g_claimed_count = 0;
 
+    // ---- hotplug event filtering & companion identity ----------------------
+
+    check(is_event_node_name("event0") && is_event_node_name("event12"),
+          "event node name matcher accepts numeric evdev nodes");
+    check(!is_event_node_name("event") && !is_event_node_name("event1a") &&
+              !is_event_node_name("mouse0"),
+          "event node name matcher rejects non-evdev names");
+
+    struct input_id bt_kb = {.bustype = BUS_BLUETOOTH, .vendor = 0x22d9, .product = 0x3869};
+    struct input_id bt_consumer = {.bustype = BUS_BLUETOOTH, .vendor = 0x22d9, .product = 0x3869};
+    struct input_id host_kb = {.bustype = BUS_HOST, .vendor = 0x22d9, .product = 0x3869};
+    struct input_id zero_id = {.bustype = BUS_HOST, .vendor = 0, .product = 0};
+    check(same_hardware_endpoint_group(&bt_kb, &bt_consumer),
+          "same bus/vendor/product forms a companion endpoint group");
+    check(!same_hardware_endpoint_group(&bt_kb, &host_kb),
+          "different bus transports do not share a companion group");
+    check(!same_hardware_endpoint_group(&zero_id, &zero_id),
+          "zero vendor/product never forms a companion group");
+
+    Config hotplug_cfg;
+    memset(&hotplug_cfg, 0, sizeof(hotplug_cfg));
+    hotplug_cfg.auto_select = true;
+    DeviceContext held_one[1];
+    held_one[0] = make_device(INPUT_DIR_PATH "/event9", 7);
+
+    union {
+        struct inotify_event ev;
+        char raw[sizeof(struct inotify_event) + 32];
+    } ev_buf;
+    bool claim_only = false;
+    char ev_path[64];
+
+    memset(&ev_buf, 0, sizeof(ev_buf));
+    ev_buf.ev.mask = IN_DELETE;
+    ev_buf.ev.len = 16;
+    snprintf(ev_buf.ev.name, 16, "event14");
+    check(!is_hotplug_event_relevant(&ev_buf.ev, &hotplug_cfg, held_one, 1, &claim_only, ev_path,
+                                     sizeof(ev_path)),
+          "deleting an unrelated event node does not tear down active keyboards");
+
+    memset(&ev_buf, 0, sizeof(ev_buf));
+    ev_buf.ev.mask = IN_DELETE;
+    ev_buf.ev.len = 16;
+    snprintf(ev_buf.ev.name, 16, "event9");
+    check(is_hotplug_event_relevant(&ev_buf.ev, &hotplug_cfg, held_one, 1, &claim_only, ev_path,
+                                    sizeof(ev_path)),
+          "deleting a currently held event node triggers hotplug recovery");
+
     printf("\n%s\n", failures == 0 ? "all checks passed" : "there were failures");
     return failures == 0 ? 0 : 1;
 }

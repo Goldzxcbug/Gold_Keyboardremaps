@@ -610,6 +610,37 @@ async function refreshApps(selectedComponent = $("#appTarget").value) {
   }
 }
 
+function deviceNodeName(device) {
+  const path = String(device?.path || "");
+  const slash = path.lastIndexOf("/");
+  return slash >= 0 ? path.slice(slash + 1) : path;
+}
+
+function hasHardwareIdentity(device) {
+  const vendor = String(device?.vendor || "").trim();
+  const product = String(device?.product || "").trim();
+  return Boolean(vendor && product && !/^0+$/.test(vendor) && !/^0+$/.test(product));
+}
+
+function deviceGroupKey(device) {
+  if (hasHardwareIdentity(device)) {
+    return `${device.bus.toLowerCase()}|${device.vendor.toLowerCase()}|${device.product.toLowerCase()}`;
+  }
+  return `single|${device.id}`;
+}
+
+function deviceBusLabel(device) {
+  const bus = String(device?.bus || "").toLowerCase();
+  const value = `${device?.name || ""} ${device?.classes || ""}`.toLowerCase();
+  if (bus === "0005" || /bluetooth|蓝牙/.test(value)) return "蓝牙";
+  if (bus === "0003") return "USB";
+  if (bus === "0019") return /external/.test(value) ? "物理触点" : "内置";
+  if (bus === "0018") return "I2C";
+  if (bus === "0006") return "虚拟";
+  if (bus === "0000") return "系统";
+  return "物理设备";
+}
+
 function deviceCategory(device) {
   const value = `${device.name} ${device.classes}`.toLowerCase();
   const isBluetooth = device.bus.toLowerCase() === "0005" || /bluetooth|蓝牙/.test(value);
@@ -627,45 +658,84 @@ function deviceCategory(device) {
 }
 
 function deviceMeta(device) {
-  return device.classes.includes("EXTERNAL") ? "外接设备 · 可用于按键映射" : "系统设备 · 可用于按键映射";
+  const node = deviceNodeName(device);
+  const role = device.classes.includes("EXTERNAL") ? "外接设备 · 可用于按键映射" : "系统设备 · 可用于按键映射";
+  return node ? `${node} · ${role}` : role;
 }
 
 function isUnsupportedDevice(device) {
-  return ["触摸屏", "触摸板", "手写笔"].includes(deviceCategory(device));
+  return ["触摸屏", "触摸板", "手写笔", "鼠标"].includes(deviceCategory(device));
 }
 
-function isAutoKeyboard(device) {
-  return ["物理键盘", "蓝牙键盘", "蓝牙多媒体键", "多媒体按键"].includes(deviceCategory(device));
+function isPrimaryKeyboardDevice(device) {
+  return ["物理键盘", "蓝牙键盘"].includes(deviceCategory(device));
+}
+
+function isAutoKeyboard(device, allDevices = state.devices) {
+  if (isUnsupportedDevice(device)) return false;
+  if (isPrimaryKeyboardDevice(device)) return true;
+  if (["多媒体按键", "蓝牙多媒体键"].includes(deviceCategory(device)) && hasHardwareIdentity(device)) {
+    const key = deviceGroupKey(device);
+    return allDevices.some((other) => other.id !== device.id && deviceGroupKey(other) === key && isPrimaryKeyboardDevice(other));
+  }
+  return false;
 }
 
 // Track UI collapse state for 2-level device groups
 const deviceGroupOpenState = new Map();
+let liveInputNodes = null;
+let liveClaimedNodes = null;
+
+function cleanGroupHeaderName(rawName) {
+  const cleaned = String(rawName || "")
+    .replace(/\b(Consumer Control|System Control|Touchpad|Mouse)\b/gi, "")
+    .replace(/[\s\-_]+/g, " ")
+    .trim();
+  return cleaned || String(rawName || "");
+}
 
 function groupDevices(devices) {
   const groups = new Map();
   for (const device of devices) {
-    // Unique hardware group key: bus + vendor + product
-    const groupKey = `${device.bus.toLowerCase()}|${device.vendor.toLowerCase()}|${device.product.toLowerCase()}`;
+    const groupKey = deviceGroupKey(device);
     if (!groups.has(groupKey)) {
-      const isBluetooth = device.bus.toLowerCase() === "0005" || /bluetooth|蓝牙/i.test(`${device.name} ${device.classes}`);
-      const busName = isBluetooth ? "蓝牙" : (device.bus.toLowerCase() === "0019" ? "物理触点" : "物理/USB");
-      // Clean base name for group header
-      let groupName = device.name
-        .replace(/\b(Consumer Control|Touchpad|Mouse|Keyboard)\b/gi, "")
-        .replace(/[\s\-_]+/g, " ")
-        .trim();
-      if (!groupName) groupName = device.name;
       groups.set(groupKey, {
         key: groupKey,
-        name: groupName,
-        busName,
-        isBluetooth,
-        devices: []
+        name: device.name,
+        busName: deviceBusLabel(device),
+        isBluetooth: deviceBusLabel(device) === "蓝牙",
+        devices: [],
       });
     }
     groups.get(groupKey).devices.push(device);
   }
-  return [...groups.values()];
+  const result = [...groups.values()].map((group) => {
+    const representative =
+      group.devices.find((d) => isPrimaryKeyboardDevice(d)) ||
+      group.devices.find((d) => !isUnsupportedDevice(d)) ||
+      group.devices[0];
+    group.name = cleanGroupHeaderName(representative.name);
+    group.busName = deviceBusLabel(representative);
+    group.isBluetooth = group.busName === "蓝牙";
+    group.hasSupported = group.devices.some((d) => !isUnsupportedDevice(d));
+    return group;
+  });
+  result.sort((a, b) => Number(b.hasSupported) - Number(a.hasSupported));
+  return result;
+}
+
+function autoDeviceMeta(device) {
+  const node = deviceNodeName(device);
+  if (liveInputNodes && liveInputNodes.has(node)) {
+    return `${node} · 自动模式已接管`;
+  }
+  if (liveClaimedNodes && liveClaimedNodes.has(node)) {
+    return `${node} · 自动模式待命`;
+  }
+  if (isAutoKeyboard(device)) {
+    return node ? `${node} · 自动模式已接管` : "自动模式已接管";
+  }
+  return deviceMeta(device);
 }
 
 function renderDevices() {
@@ -678,6 +748,7 @@ function renderDevices() {
   }
 
   const groups = groupDevices(state.devices);
+  const firstSupportedGroupIndex = groups.findIndex((group) => group.hasSupported);
 
   list.innerHTML = groups.map((group, groupIndex) => {
     const supportedDevices = group.devices.filter((d) => !isUnsupportedDevice(d));
@@ -685,36 +756,63 @@ function renderDevices() {
     let checkedCount = 0;
 
     for (const d of supportedDevices) {
-      const isChecked = state.auto ? isAutoKeyboard(d) : state.selected.has(d.id);
+      const node = deviceNodeName(d);
+      const isChecked = state.auto
+        ? (liveInputNodes || liveClaimedNodes
+          ? Boolean(liveInputNodes?.has(node) || liveClaimedNodes?.has(node))
+          : isAutoKeyboard(d))
+        : state.selected.has(d.id);
       if (isChecked) checkedCount++;
     }
 
     const allChecked = allCount > 0 && checkedCount === allCount;
     const partialChecked = checkedCount > 0 && checkedCount < allCount;
-    // Default open if it contains checked devices or if previously opened
     const isOpen = deviceGroupOpenState.has(group.key)
       ? deviceGroupOpenState.get(group.key)
-      : (checkedCount > 0 || groupIndex === 0);
+      : (checkedCount > 0 || (firstSupportedGroupIndex >= 0 && groupIndex === firstSupportedGroupIndex));
+
+    const nameCounts = new Map();
+    group.devices.forEach((d) => nameCounts.set(d.name, (nameCounts.get(d.name) || 0) + 1));
+    const nameIndexes = new Map();
 
     const subRowsHtml = group.devices.map((device) => {
+      const index = (nameIndexes.get(device.name) || 0) + 1;
+      nameIndexes.set(device.name, index);
+      const suffix = nameCounts.get(device.name) > 1 ? `（节点 ${index}）` : "";
       const unsupported = isUnsupportedDevice(device);
-      const autoSelected = state.auto && isAutoKeyboard(device);
+      const node = deviceNodeName(device);
+      const autoSelected = state.auto && (
+        liveInputNodes || liveClaimedNodes
+          ? Boolean(liveInputNodes?.has(node) || liveClaimedNodes?.has(node))
+          : isAutoKeyboard(device)
+      );
       const checked = autoSelected || (!state.auto && state.selected.has(device.id));
       const disabled = state.auto || unsupported;
+      const metaText = unsupported
+        ? `${node ? `${node} · ` : ""}触摸/指针类设备未接入按键引擎`
+        : (state.auto ? autoDeviceMeta(device) : deviceMeta(device));
       return `
       <label class="device-sub-row${unsupported ? " unsupported" : ""}">
         <input type="checkbox" data-device-id="${html(device.id)}" data-group-key="${html(group.key)}" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}>
         <span class="device-main">
           <span class="device-title">
-            <span class="device-name">${html(device.name)}</span>
+            <span class="device-name">${html(device.name)}${suffix}</span>
             <span class="device-category">${html(deviceCategory(device))}</span>
             ${unsupported ? '<span class="device-support">暂不支持</span>' : ""}
           </span>
-          <span class="device-meta">${html(unsupported ? "触摸/指针类设备未接入按键引擎" : state.auto && isAutoKeyboard(device) ? "自动模式已接管" : deviceMeta(device))}</span>
+          <span class="device-meta">${html(metaText)}</span>
         </span>
       </label>
       `;
     }).join("");
+
+    const headerMeta = state.auto
+      ? (allCount === 0
+        ? "暂不支持按键映射"
+        : (checkedCount > 0 ? `自动模式管理中（${checkedCount}/${allCount} 个可用子节点）` : "自动模式未接管此设备"))
+      : (allCount === 0
+        ? "无可用按键子节点"
+        : (allChecked ? "已全选所有可用子节点" : (checkedCount > 0 ? `已选 ${checkedCount}/${allCount} 个可用子节点` : "未勾选此设备")));
 
     return `
     <div class="device-group${isOpen ? " is-open" : ""}" data-group-key="${html(group.key)}">
@@ -729,7 +827,7 @@ function renderDevices() {
             <span class="device-category">${html(group.busName)}</span>
             <span class="muted" style="font-size: 11px;">(${group.devices.length} 个子节点)</span>
           </span>
-          <span class="device-meta">${state.auto ? "自动模式模式管理中" : (allChecked ? "已全选所有可用子节点" : (checkedCount > 0 ? `已选 ${checkedCount}/${allCount} 个可用子节点` : "未勾选此设备"))}</span>
+          <span class="device-meta">${html(headerMeta)}</span>
         </span>
         <button type="button" class="device-group-toggle group-toggle-trigger" aria-label="展开或折叠">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1643,30 +1741,73 @@ async function restoreDefaults() {
   await applyConfig($("#restoreDefaults"), "恢复中", "恢复默认", "默认设置已恢复，输入转发器已重新加载。");
 }
 
-let lastInputGeneration = null;
+let lastInputSignature = null;
+let hotplugPollTimer = null;
+let hotplugPollBusy = false;
 
-async function checkDeviceHotplug() {
-  try {
-    const { stdout } = await exec(`${CONTROL} input-status`);
-    const line = stdout.trim();
-    const genMatch = line.match(/generation=(\d+)/);
-    if (genMatch) {
-      const currentGen = genMatch[1];
-      if (lastInputGeneration !== null && lastInputGeneration !== currentGen) {
-        lastInputGeneration = currentGen;
-        // Hotplug event detected from daemon inotify, auto refresh device list
-        const { stdout: devicesOut } = await exec(`${CONTROL} list`);
-        parseDevices(devicesOut);
-        renderDevices();
-        setNotice("检测到输入设备热插拔，节点列表已自动同步。");
-      } else {
-        lastInputGeneration = currentGen;
-      }
-    }
-  } catch (_) {}
+function parseInputStatusSnapshot(line) {
+  const fields = String(line || "").trim().split("\t");
+  if (fields.length < 9 || fields[0] !== "GOLDCTL1" || fields[1] !== "input-status" ||
+      fields[2] !== "ok" || fields[3] !== "code=ready") {
+    return null;
+  }
+  const values = {};
+  for (let index = 4; index < fields.length; index++) {
+    const sep = fields[index].indexOf("=");
+    if (sep < 0) continue;
+    values[fields[index].slice(0, sep)] = fields[index].slice(sep + 1);
+  }
+  if (!("nodes" in values)) return null;
+  const parseList = (raw) => (!raw || raw === "-" ? new Set() : new Set(raw.split(",").filter(Boolean)));
+  const nodesRaw = values.nodes || "-";
+  const claimedRaw = values.claimed || "-";
+  return {
+    nodes: parseList(nodesRaw),
+    claimed: parseList(claimedRaw),
+    signature: `${nodesRaw}|${claimedRaw}`,
+  };
 }
 
-async function refreshStatus() {
+async function checkDeviceHotplug({ notify = true, refreshOnChange = true } = {}) {
+  if (hotplugPollBusy) return;
+  hotplugPollBusy = true;
+  try {
+    const { stdout } = await exec(`${CONTROL} input-status`);
+    const snapshot = parseInputStatusSnapshot(stdout);
+    if (!snapshot) return;
+
+    liveInputNodes = snapshot.nodes;
+    liveClaimedNodes = snapshot.claimed;
+
+    const changed = lastInputSignature !== null && lastInputSignature !== snapshot.signature;
+    lastInputSignature = snapshot.signature;
+
+    if (changed && refreshOnChange) {
+      const { stdout: devicesOut } = await exec(`${CONTROL} list`);
+      parseDevices(devicesOut);
+      renderDevices();
+      if (notify) {
+        setNotice("检测到输入设备热插拔，节点列表已自动同步。");
+      }
+    } else if (state.auto) {
+      renderDevices();
+    }
+  } catch (_) {
+    // Snapshot may be temporarily absent while restarting.
+  } finally {
+    hotplugPollBusy = false;
+  }
+}
+
+function startHotplugPolling() {
+  if (hotplugPollTimer !== null || !ksuBridge()) return;
+  hotplugPollTimer = setInterval(() => {
+    if (document.hidden || captureTimer !== null) return;
+    checkDeviceHotplug({ notify: true, refreshOnChange: true });
+  }, 3000);
+}
+
+async function refreshStatus({ notifyHotplug = false } = {}) {
   try {
     const { stdout } = await exec(`${CONTROL} status`);
     const status = stdout.trim();
@@ -1677,7 +1818,7 @@ async function refreshStatus() {
     } else {
       setStatus("已停止", "error");
     }
-    await checkDeviceHotplug();
+    await checkDeviceHotplug({ notify: notifyHotplug, refreshOnChange: true });
   } catch (error) {
     setStatus("不可用", "error");
     throw error;
@@ -1691,6 +1832,7 @@ async function refreshDevices() {
   try {
     const { stdout } = await exec(`${CONTROL} list`);
     parseDevices(stdout);
+    await checkDeviceHotplug({ notify: false, refreshOnChange: false });
     renderDevices();
     setNotice("输入节点已刷新。");
   } catch (error) {
@@ -1712,7 +1854,8 @@ async function initialize() {
     parseDevices(devices.stdout);
     renderDevices();
     renderMappings();
-    await refreshStatus();
+    await refreshStatus({ notifyHotplug: false });
+    startHotplugPolling();
   } catch (error) {
     setStatus("不可用", "error");
     setNotice(error.message, true);
@@ -1768,17 +1911,19 @@ $("#autoSelect").addEventListener("change", (event) => {
 });
 // Hierarchical device list interaction: accordion fold & master checkbox
 $("#deviceList").addEventListener("click", (event) => {
-  // 1. Toggle accordion collapse on group header click
-  const trigger = event.target.closest(".group-toggle-trigger");
-  if (trigger) {
-    const groupCard = trigger.closest(".device-group");
+  // 1. Toggle accordion collapse when clicking anywhere on the header except the checkbox
+  if (event.target.closest(".group-master-checkbox")) {
+    return;
+  }
+  const header = event.target.closest(".device-group-header");
+  if (header) {
+    const groupCard = header.closest(".device-group");
     if (groupCard) {
       const groupKey = groupCard.dataset.groupKey;
       const isOpen = !groupCard.classList.contains("is-open");
       groupCard.classList.toggle("is-open", isOpen);
       deviceGroupOpenState.set(groupKey, isOpen);
     }
-    return;
   }
 });
 
@@ -1788,14 +1933,9 @@ $("#deviceList").addEventListener("change", (event) => {
     const groupKey = event.target.dataset.groupKey;
     const shouldCheck = event.target.checked;
     state.auto = false;
-    const [devBus, devVendor, devProduct] = groupKey.split("|");
-    const targetDevices = state.devices.filter((item) => {
-      const [_, itemBus, itemVendor, itemProduct] = item.id.split("|");
-      return itemBus.toLowerCase() === devBus &&
-             itemVendor.toLowerCase() === devVendor &&
-             itemProduct.toLowerCase() === devProduct &&
-             !isUnsupportedDevice(item);
-    });
+    const targetDevices = state.devices.filter((item) =>
+      deviceGroupKey(item) === groupKey && !isUnsupportedDevice(item)
+    );
 
     if (shouldCheck) {
       targetDevices.forEach((item) => state.selected.add(item.id));

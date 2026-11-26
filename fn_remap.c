@@ -57,6 +57,9 @@
 // How often a running worker refreshes the snapshot. keyboardctl treats a
 // snapshot older than a few of these as abandoned.
 #define INPUT_STATUS_HEARTBEAT_SECONDS 1
+#ifndef INPUT_DIR_PATH
+#define INPUT_DIR_PATH "/dev/input"
+#endif
 #define VIRTUAL_NAME_PREFIX "Gold Keyboardremaps"
 #define COLOROS_WINDOW_LAUNCHER "/data/adb/modules/Gold_Keyboardremaps/bin/coloros-window-launcher.jar"
 #define COLOROS_WINDOW_LAUNCHER_CLASS "gold.keyboardremaps.ColorOS"
@@ -822,6 +825,25 @@ static bool contains_text(const char *text, const char *needle) {
     return strstr(lower, needle) != NULL;
 }
 
+static bool is_button_input_code(unsigned int code) {
+    return (code >= BTN_MISC && code <= BTN_GEAR_DOWN) ||
+           (code >= BTN_DPAD_UP && code <= BTN_DPAD_RIGHT) ||
+           (code >= BTN_TRIGGER_HAPPY1 && code <= BTN_TRIGGER_HAPPY40);
+}
+
+static bool has_non_button_key_events(int fd) {
+    uint8_t key_bits[(KEY_MAX + 8) / 8] = {0};
+    if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0) {
+        return false;
+    }
+    for (unsigned int key = 1; key <= KEY_MAX; key++) {
+        if (bit_is_set(key_bits, key) && !is_button_input_code(key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool is_pointing_device(int fd, const char *name) {
     if (contains_text(name, "touch") || contains_text(name, "pencil") ||
         contains_text(name, "stylus") || contains_text(name, "mouse") ||
@@ -860,7 +882,7 @@ static bool is_alphanumeric_keyboard(int fd) {
            bit_is_set(key_bits, KEY_SPACE) && bit_is_set(key_bits, KEY_ENTER);
 }
 
-static bool is_primary_keyboard(int fd, const char *name) {
+static bool is_auto_keyboard(int fd, const char *name) {
     if (!has_key_events(fd) || is_pointing_device(fd, name)) {
         return false;
     }
@@ -868,38 +890,49 @@ static bool is_primary_keyboard(int fd, const char *name) {
         contains_text(name, "consumer")) {
         return false;
     }
-    if (is_alphanumeric_keyboard(fd)) {
-        return true;
-    }
-    return contains_text(name, "keyboard") || contains_text(name, "keypad") ||
-           contains_text(name, "kbd");
-}
-
-static bool is_auto_keyboard(int fd, const char *name) {
-    if (!has_key_events(fd) || is_pointing_device(fd, name)) {
-        return false;
-    }
-    if (contains_text(name, "power") || contains_text(name, "volume")) {
-        return false;
-    }
-    if (contains_text(name, "consumer")) {
-        return contains_text(name, "keyboard") || contains_text(name, "keypad") ||
-               contains_text(name, "kbd");
-    }
     return is_alphanumeric_keyboard(fd) || contains_text(name, "keyboard") ||
            contains_text(name, "keypad") || contains_text(name, "kbd") ||
            contains_text(name, "hid");
 }
 
-static bool is_button_input_code(unsigned int code) {
-    return (code >= BTN_MISC && code <= BTN_GEAR_DOWN) ||
-           (code >= BTN_DPAD_UP && code <= BTN_DPAD_RIGHT) ||
-           (code >= BTN_TRIGGER_HAPPY1 && code <= BTN_TRIGGER_HAPPY40);
+static bool same_hardware_endpoint_group(const struct input_id *first,
+                                         const struct input_id *second) {
+    return first->vendor != 0 && first->product != 0 &&
+           first->bustype == second->bustype &&
+           first->vendor == second->vendor &&
+           first->product == second->product;
+}
+
+// Companion key interfaces (such as a keyboard's Consumer Control node) share
+// the exact bus/vendor/product of an already-identified primary keyboard.
+static bool is_companion_endpoint(int fd, const char *name, const struct input_id *id,
+                                  const struct input_id *primary_ids, size_t primary_count) {
+    if (is_pointing_device(fd, name) || contains_text(name, "power")) {
+        return false;
+    }
+    if (!has_non_button_key_events(fd)) {
+        return false;
+    }
+    for (size_t index = 0; index < primary_count; index++) {
+        if (same_hardware_endpoint_group(id, &primary_ids[index])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool matches_selector(const struct input_id *id, const DeviceSelector *selector) {
     return id->bustype == selector->bus && id->vendor == selector->vendor &&
            id->product == selector->product;
+}
+
+static bool matches_any_selector(const struct input_id *id, const Config *config) {
+    for (size_t index = 0; index < config->selector_count; index++) {
+        if (matches_selector(id, &config->selectors[index])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static int open_source(const char *path, int access_mode, char *name, size_t name_size,
@@ -946,8 +979,12 @@ static bool selection_has_path(const InputSource *sources, size_t count, const c
 }
 
 // When an event number changes, a keyboard interface is a better match than
-// the same device's media controls. Button-only interfaces cannot be a fallback.
-static int fallback_source_rank(int fd) {
+// the same device's media controls. Pointer and button-only interfaces cannot
+// be a fallback.
+static int fallback_source_rank(int fd, const char *name) {
+    if (is_pointing_device(fd, name)) {
+        return 0;
+    }
     uint8_t keys[(KEY_MAX + 8) / 8] = {0};
     if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keys)), keys) < 0) {
         return 0;
@@ -969,13 +1006,13 @@ static bool find_replugged_source(InputSource *source, const DeviceSelector *sel
     bool ambiguous = false;
     for (int number = 0; number < EVENT_SCAN_LIMIT; number++) {
         char path[64];
-        snprintf(path, sizeof(path), "/dev/input/event%d", number);
+        snprintf(path, sizeof(path), "%s/event%d", INPUT_DIR_PATH, number);
         InputSource candidate;
         if (selection_has_path(selected, count, path) ||
             !open_selected_source(&candidate, path, access_mode, selector)) {
             continue;
         }
-        int rank = fallback_source_rank(candidate.fd);
+        int rank = fallback_source_rank(candidate.fd, candidate.name);
         if (rank > best_rank) {
             if (best_rank != 0) {
                 close(source->fd);
@@ -2052,7 +2089,7 @@ static void find_default_device(DeviceContext devices[MAX_DEVICES], size_t *coun
             char path[64];
             char name[128];
             struct input_id id;
-            snprintf(path, sizeof(path), "/dev/input/event%d", event_number);
+            snprintf(path, sizeof(path), "%s/event%d", INPUT_DIR_PATH, event_number);
             int fd = open_source(path, O_RDWR, name, sizeof(name), &id);
             if (fd < 0) {
                 continue;
@@ -2067,6 +2104,38 @@ static void find_default_device(DeviceContext devices[MAX_DEVICES], size_t *coun
             }
             (void)add_device(devices, count, fd, path, name, &id, true);
         }
+
+        if (*count == 0) {
+            continue;
+        }
+
+        // Companion pass: capture non-pointer key endpoints (e.g. Consumer Control)
+        // sharing the exact bus/vendor/product of any primary keyboard on the
+        // winning transport.
+        struct input_id primary_ids[MAX_DEVICES];
+        size_t primary_count = *count;
+        for (size_t index = 0; index < primary_count; index++) {
+            primary_ids[index] = devices[index].source_id;
+        }
+        for (int event_number = 0;
+             event_number < EVENT_SCAN_LIMIT && *count < MAX_DEVICES; event_number++) {
+            char path[64];
+            char name[128];
+            struct input_id id;
+            snprintf(path, sizeof(path), "%s/event%d", INPUT_DIR_PATH, event_number);
+            if (source_already_open(devices, *count, path)) {
+                continue;
+            }
+            int fd = open_source(path, O_RDWR, name, sizeof(name), &id);
+            if (fd < 0) {
+                continue;
+            }
+            if (!is_companion_endpoint(fd, name, &id, primary_ids, primary_count)) {
+                close(fd);
+                continue;
+            }
+            (void)add_device(devices, count, fd, path, name, &id, false);
+        }
     }
 }
 
@@ -2074,7 +2143,8 @@ static char g_claimed[EVENT_SCAN_LIMIT][16];
 static size_t g_claimed_count;
 
 static void claim_source_path(const char *path) {
-    const char *name = strrchr(path, '/') + 1;
+    const char *slash = strrchr(path, '/');
+    const char *name = slash == NULL ? path : slash + 1;
     for (size_t index = 0; index < g_claimed_count; index++) {
         if (strcmp(g_claimed[index], name) == 0) {
             return;
@@ -2095,16 +2165,38 @@ static void find_claimed_keyboards(const Config *config, const InputSource *sele
         return;
     }
 
-    // Reserve the whole family in auto mode: either transport may be taken
-    // after a replug, and other readers should keep clear of both.
+    // Reserve the whole family in auto mode: either transport (and its companion
+    // key endpoints) may be taken after a replug, and other readers should keep
+    // clear of all of them.
+    struct input_id primary_ids[MAX_DEVICES];
+    size_t primary_count = 0;
     for (int event_number = 0; event_number < EVENT_SCAN_LIMIT; event_number++) {
         char path[64];
         char name[128];
         struct input_id id;
-        snprintf(path, sizeof(path), "/dev/input/event%d", event_number);
-        int fd = open_source(path, O_RDWR, name, sizeof(name), &id);
+        snprintf(path, sizeof(path), "%s/event%d", INPUT_DIR_PATH, event_number);
+        int fd = open_source(path, O_RDONLY, name, sizeof(name), &id);
         if (fd >= 0) {
             if (is_auto_keyboard(fd, name)) {
+                claim_source_path(path);
+                if (primary_count < MAX_DEVICES && id.vendor != 0 && id.product != 0) {
+                    primary_ids[primary_count++] = id;
+                }
+            }
+            close(fd);
+        }
+    }
+    if (primary_count == 0) {
+        return;
+    }
+    for (int event_number = 0; event_number < EVENT_SCAN_LIMIT; event_number++) {
+        char path[64];
+        char name[128];
+        struct input_id id;
+        snprintf(path, sizeof(path), "%s/event%d", INPUT_DIR_PATH, event_number);
+        int fd = open_source(path, O_RDONLY, name, sizeof(name), &id);
+        if (fd >= 0) {
+            if (is_companion_endpoint(fd, name, &id, primary_ids, primary_count)) {
                 claim_source_path(path);
             }
             close(fd);
@@ -2128,12 +2220,15 @@ static int capture_key_events(unsigned int seconds, bool collect_all) {
         sources[index] = selected[index].fd;
     }
     if (source_count == 0 && config.auto_select) {
+        char open_paths[MAX_DEVICES][64];
+        struct input_id primary_ids[MAX_DEVICES];
+        size_t primary_count = 0;
         for (int event_number = 0; event_number < EVENT_SCAN_LIMIT && source_count < MAX_DEVICES;
              event_number++) {
             char path[64];
             char name[128];
             struct input_id id;
-            snprintf(path, sizeof(path), "/dev/input/event%d", event_number);
+            snprintf(path, sizeof(path), "%s/event%d", INPUT_DIR_PATH, event_number);
             int fd = open_source(path, O_RDONLY, name, sizeof(name), &id);
             if (fd < 0) {
                 continue;
@@ -2142,6 +2237,38 @@ static int capture_key_events(unsigned int seconds, bool collect_all) {
                 close(fd);
                 continue;
             }
+            snprintf(open_paths[source_count], sizeof(open_paths[0]), "%s", path);
+            if (primary_count < MAX_DEVICES && id.vendor != 0 && id.product != 0) {
+                primary_ids[primary_count++] = id;
+            }
+            sources[source_count++] = fd;
+        }
+        for (int event_number = 0;
+             primary_count > 0 && event_number < EVENT_SCAN_LIMIT && source_count < MAX_DEVICES;
+             event_number++) {
+            char path[64];
+            char name[128];
+            struct input_id id;
+            snprintf(path, sizeof(path), "%s/event%d", INPUT_DIR_PATH, event_number);
+            bool already = false;
+            for (size_t index = 0; index < source_count; index++) {
+                if (strcmp(open_paths[index], path) == 0) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) {
+                continue;
+            }
+            int fd = open_source(path, O_RDONLY, name, sizeof(name), &id);
+            if (fd < 0) {
+                continue;
+            }
+            if (!is_companion_endpoint(fd, name, &id, primary_ids, primary_count)) {
+                close(fd);
+                continue;
+            }
+            snprintf(open_paths[source_count], sizeof(open_paths[0]), "%s", path);
             sources[source_count++] = fd;
         }
     }
@@ -2514,6 +2641,129 @@ static void status_heartbeat(const DeviceContext *devices, size_t count) {
     }
 }
 
+typedef enum {
+    FORWARD_ERROR = -1,
+    FORWARD_STOPPED = 0,
+    FORWARD_HOTPLUG = 1,
+} ForwardResult;
+
+static int open_input_inotify(uint32_t mask) {
+    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    if (inotify_add_watch(fd, INPUT_DIR_PATH, mask) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool is_event_node_name(const char *name) {
+    if (strncmp(name, "event", 5) != 0 || !isdigit((unsigned char)name[5])) {
+        return false;
+    }
+    for (const char *cursor = name + 6; *cursor != '\0'; cursor++) {
+        if (!isdigit((unsigned char)*cursor)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_hotplug_event_relevant(const struct inotify_event *event, const Config *config,
+                                      const DeviceContext *devices, size_t count,
+                                      bool *claim_only, char *out_path, size_t out_path_size) {
+    *claim_only = false;
+    if (event->len == 0 || !is_event_node_name(event->name)) {
+        return false;
+    }
+    int length = snprintf(out_path, out_path_size, "%s/%s", INPUT_DIR_PATH, event->name);
+    if (length < 0 || (size_t)length >= out_path_size) {
+        return false;
+    }
+    if ((event->mask & IN_DELETE) != 0) {
+        // Only tear down forwarding if one of our own grabbed nodes disappeared.
+        return count > 0 && source_already_open(devices, count, out_path);
+    }
+    if ((event->mask & IN_CREATE) == 0) {
+        return false;
+    }
+    if (count > 0 && source_already_open(devices, count, out_path)) {
+        return false;
+    }
+
+    char dev_name[128];
+    struct input_id dev_id;
+    int dev_fd = open_source(out_path, O_RDONLY, dev_name, sizeof(dev_name), &dev_id);
+    if (dev_fd < 0) {
+        return false;
+    }
+
+    bool relevant = false;
+    if (config->selector_count > 0) {
+        relevant = matches_any_selector(&dev_id, config) && has_key_events(dev_fd);
+    } else if (config->auto_select) {
+        if (is_auto_keyboard(dev_fd, dev_name)) {
+            if (count > 0 && dev_id.bustype == BUS_BLUETOOTH &&
+                source_is_transport_duplicate(devices, count, dev_name, &dev_id)) {
+                // Physical transport is already held; add the standby Bluetooth
+                // node to `claimed` without interrupting active typing.
+                *claim_only = true;
+            } else {
+                relevant = true;
+            }
+        } else if (count > 0) {
+            struct input_id primary_ids[MAX_DEVICES];
+            for (size_t index = 0; index < count; index++) {
+                primary_ids[index] = devices[index].source_id;
+            }
+            relevant = is_companion_endpoint(dev_fd, dev_name, &dev_id, primary_ids, count);
+        }
+    }
+    close(dev_fd);
+    return relevant;
+}
+
+static bool drain_inotify_hotplug(int inotify_fd, const Config *config,
+                                  const DeviceContext *devices, size_t count) {
+    _Alignas(struct inotify_event) char buffer[1024];
+    bool relevant = false;
+    bool claims_updated = false;
+    for (;;) {
+        ssize_t bytes_read = read(inotify_fd, buffer, sizeof(buffer));
+        if (bytes_read <= 0) {
+            if (bytes_read < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        size_t total = (size_t)bytes_read;
+        size_t offset = 0;
+        while (total - offset >= sizeof(struct inotify_event)) {
+            const struct inotify_event *event = (const struct inotify_event *)(buffer + offset);
+            size_t step = sizeof(struct inotify_event) + event->len;
+            if (event->len > total - offset - sizeof(struct inotify_event)) {
+                break;
+            }
+            bool claim_only = false;
+            char path[64];
+            if (is_hotplug_event_relevant(event, config, devices, count, &claim_only, path,
+                                          sizeof(path))) {
+                relevant = true;
+            } else if (claim_only) {
+                claim_source_path(path);
+                claims_updated = true;
+            }
+            offset += step;
+        }
+    }
+    if (claims_updated && !relevant && count > 0) {
+        status_publish(devices, count);
+    }
+    return relevant;
+}
+
 // Waits while keeping the heartbeat alive. The daemon is still running and still
 // holds exactly this set, and the snapshot has to keep saying so.
 static void status_sleep(unsigned int seconds, const DeviceContext *devices, size_t count) {
@@ -2523,18 +2773,49 @@ static void status_sleep(unsigned int seconds, const DeviceContext *devices, siz
     }
 }
 
-static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Config *config,
-                           unsigned int *retry_delay) {
-    int inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (inotify_fd >= 0) {
-        if (inotify_add_watch(inotify_fd, "/dev/input", IN_CREATE | IN_DELETE) < 0) {
-            close(inotify_fd);
-            inotify_fd = -1;
-        }
+// Waits up to `seconds` while keeping the 1s heartbeat alive, waking immediately
+// if a relevant keyboard appears under INPUT_DIR_PATH.
+static bool status_wait_for_hotplug(unsigned int seconds, const DeviceContext *devices,
+                                    size_t count, const Config *config) {
+    int inotify_fd = open_input_inotify(IN_CREATE);
+    if (inotify_fd < 0) {
+        status_sleep(seconds, devices, count);
+        return false;
     }
 
+    bool woke_by_hotplug = false;
+    int64_t deadline = monotonic_milliseconds() + (int64_t)seconds * 1000;
+    while (keep_running) {
+        status_heartbeat(devices, count);
+        int64_t remaining = deadline - monotonic_milliseconds();
+        if (remaining <= 0) {
+            break;
+        }
+        int timeout_ms = remaining > 1000 ? 1000 : (int)remaining;
+        struct pollfd pfd = {.fd = inotify_fd, .events = POLLIN};
+        int ready = poll(&pfd, 1, timeout_ms);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (ready > 0 && (pfd.revents & POLLIN) != 0) {
+            if (drain_inotify_hotplug(inotify_fd, config, devices, count)) {
+                woke_by_hotplug = true;
+                break;
+            }
+        }
+    }
+    close(inotify_fd);
+    return woke_by_hotplug;
+}
+
+static ForwardResult forward_devices(DeviceContext devices[MAX_DEVICES], size_t count,
+                                     Config *config, unsigned int *retry_delay) {
+    int inotify_fd = open_input_inotify(IN_CREATE | IN_DELETE);
     struct pollfd fds[MAX_DEVICES * 2 + 1];
-    int result = 0;
+    ForwardResult result = FORWARD_STOPPED;
 
     while (keep_running) {
         // Driven by elapsed time, never by "poll timed out": a keyboard that is
@@ -2549,7 +2830,7 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Con
             if (profile_switch_pending()) {
                 for (size_t index = 0; index < count; index++) {
                     if (release_all_keys(&devices[index]) < 0) {
-                        result = -1;
+                        result = FORWARD_ERROR;
                         goto cleanup;
                     }
                 }
@@ -2576,7 +2857,7 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Con
             if (errno == EINTR) {
                 continue;
             }
-            result = -1;
+            result = FORWARD_ERROR;
             goto cleanup;
         }
         for (size_t index = 0; index < count; index++) {
@@ -2584,51 +2865,16 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Con
             struct pollfd *virtual = &fds[index * 2 + 1];
             if (source->revents & (POLLERR | POLLHUP | POLLNVAL) ||
                 virtual->revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                result = -1;
+                result = FORWARD_ERROR;
                 goto cleanup;
             }
         }
-
-        // Process event-driven hotplug notifications from /dev/input
-        if (inotify_index >= 0 && (fds[inotify_index].revents & POLLIN)) {
-            char buffer[512] __attribute__((aligned(__alignof__(struct inotify_event))));
-            bool device_change_relevant = false;
-            ssize_t bytes_read;
-            while ((bytes_read = read(inotify_fd, buffer, sizeof(buffer))) > 0) {
-                const struct inotify_event *event;
-                for (char *ptr = buffer; ptr < buffer + bytes_read;
-                     ptr += sizeof(struct inotify_event) + event->len) {
-                    event = (const struct inotify_event *)ptr;
-                    if (event->len > 0 && strncmp(event->name, "event", 5) == 0) {
-                        char path[64];
-                        snprintf(path, sizeof(path), "/dev/input/%s", event->name);
-                        char dev_name[128];
-                        struct input_id dev_id;
-                        int dev_fd = open_source(path, O_RDONLY, dev_name, sizeof(dev_name), &dev_id);
-                        if (dev_fd >= 0) {
-                            if (!is_pointing_device(dev_fd, dev_name) &&
-                                (is_primary_keyboard(dev_fd, dev_name) ||
-                                 is_auto_keyboard(dev_fd, dev_name))) {
-                                device_change_relevant = true;
-                            }
-                            close(dev_fd);
-                        } else if (event->mask & IN_DELETE) {
-                            device_change_relevant = true;
-                        }
-                    }
-                }
-            }
-            if (device_change_relevant) {
-                fprintf(stderr, "fn-remap: input device hotplug detected via inotify\n");
-                result = 0;
-                goto cleanup;
-            }
-        }
-
+        // Drain real input/output events before handling hotplug so keys that
+        // arrived in the same poll wakeup are never dropped.
         for (size_t index = 0; index < count; index++) {
             struct pollfd *source = &fds[index * 2];
             if ((source->revents & POLLIN) && handle_source(&devices[index], config) < 0) {
-                result = -1;
+                result = FORWARD_ERROR;
                 goto cleanup;
             }
             if (source->revents & POLLIN) {
@@ -2640,12 +2886,23 @@ static int forward_devices(DeviceContext devices[MAX_DEVICES], size_t count, Con
         for (size_t index = 0; index < count; index++) {
             struct pollfd *virtual = &fds[index * 2 + 1];
             if ((virtual->revents & POLLIN) && handle_virtual_output(&devices[index]) < 0) {
-                result = -1;
+                result = FORWARD_ERROR;
+                goto cleanup;
+            }
+        }
+
+        if (inotify_index >= 0 && (fds[inotify_index].revents & POLLIN) != 0) {
+            if (drain_inotify_hotplug(inotify_fd, config, devices, count)) {
+                for (size_t index = 0; index < count; index++) {
+                    (void)release_all_keys(&devices[index]);
+                }
+                fprintf(stderr, "fn-remap: input device hotplug detected via inotify\n");
+                result = FORWARD_HOTPLUG;
                 goto cleanup;
             }
         }
     }
-    result = 0;
+    result = FORWARD_STOPPED;
 
 cleanup:
     if (inotify_fd >= 0) {
@@ -2710,31 +2967,49 @@ int main(int argc, char **argv) {
             find_default_device(devices, &count);
         }
         if (count == 0) {
-            fprintf(stderr, "fn-remap: no selected keyboard is available; retrying in %u seconds\n",
+            fprintf(stderr, "fn-remap: no selected keyboard is available; waiting up to %u seconds\n",
                     retry_delay);
             // Alive and holding nothing. Saying so is what separates "verified
-            // empty" from "no snapshot at all" for the reader, and waiting
-            // through the retry keeps the heartbeat going so a healthy daemon
-            // does not age into "unknown" while it is simply between devices.
-            status_sleep(retry_delay, devices, 0);
-            retry_delay = next_retry_delay(retry_delay);
+            // empty" from "no snapshot at all" for the reader, and waiting via
+            // inotify keeps the 1s heartbeat going while waking immediately if a
+            // matching keyboard appears.
+            if (status_wait_for_hotplug(retry_delay, devices, 0, &config)) {
+                fprintf(stderr, "fn-remap: input device hotplug detected while waiting\n");
+                retry_delay = RETRY_DELAY_INITIAL_SECONDS;
+            } else {
+                retry_delay = next_retry_delay(retry_delay);
+            }
             continue;
         }
 
         fprintf(stderr, "fn-remap: active on %zu keyboard(s), %zu rule(s)\n", count,
                 config.rule_count);
         status_publish(devices, count);
-        (void)forward_devices(devices, count, &config, &retry_delay);
+        int64_t started_ms = monotonic_milliseconds();
+        ForwardResult forward_result = forward_devices(devices, count, &config, &retry_delay);
         for (size_t index = 0; index < count; index++) {
             close_device(&devices[index]);
         }
         // The grabs are gone. Say so now, rather than leaving the previous claim
-        // standing through the retry sleep.
+        // standing through any retry wait.
         status_release(devices, 0);
-        if (keep_running) {
-            fprintf(stderr, "fn-remap: input device changed, retrying in %u seconds\n",
-                    retry_delay);
-            status_sleep(retry_delay, devices, 0);
+        if (!keep_running) {
+            break;
+        }
+        int64_t ran_ms = monotonic_milliseconds() - started_ms;
+        if (forward_result == FORWARD_HOTPLUG && ran_ms >= 200) {
+            retry_delay = RETRY_DELAY_INITIAL_SECONDS;
+            continue;
+        }
+        if (forward_result == FORWARD_ERROR && ran_ms >= 1000) {
+            fprintf(stderr, "fn-remap: input device disconnected, rescanning immediately\n");
+            retry_delay = RETRY_DELAY_INITIAL_SECONDS;
+            continue;
+        }
+        fprintf(stderr, "fn-remap: input device changed, retrying in %u seconds\n", retry_delay);
+        if (status_wait_for_hotplug(retry_delay, devices, 0, &config)) {
+            retry_delay = RETRY_DELAY_INITIAL_SECONDS;
+        } else {
             retry_delay = next_retry_delay(retry_delay);
         }
     }

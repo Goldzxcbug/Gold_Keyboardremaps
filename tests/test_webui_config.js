@@ -242,5 +242,63 @@ vm.runInContext('state.prefix = ""', sandbox);
 check(vm.runInContext('applyGlobalPrefix(["KEY_1"], true).join("+")', sandbox) === 'KEY_1',
   'an empty global prefix adds nothing');
 
+// ---- hierarchical device grouping & hotplug snapshot parsing ------------
+
+const sampleDevicesOutput = [
+  '/dev/input/event15\t0005\t330a\t0001\tOnePlus Pencil\tKEYBOARD | EXTERNAL',
+  '/dev/input/event12\t0005\t22d9\t3869\tOnePlus Pad 2 Pro Keyboard Consumer Control\tKEYBOARD | EXTERNAL',
+  '/dev/input/event13\t0005\t22d9\t3869\tOnePlus Pad 2 Pro Keyboard Touchpad\tTOUCH | TOUCH_MT | TOUCHPAD | EXTERNAL',
+  '/dev/input/event11\t0005\t22d9\t3869\tOnePlus Pad 2 Pro Keyboard\tKEYBOARD | ALPHAKEY | EXTERNAL',
+  '/dev/input/event10\t0019\t22d9\t3869\tpogo_touchpad\tTOUCH | TOUCH_MT | TOUCHPAD | EXTERNAL',
+  '/dev/input/event9\t0019\t22d9\t3869\tOnePlus Pad 2 Pro Keyboard\tKEYBOARD | ALPHAKEY | EXTERNAL',
+  '/dev/input/event8\t0005\t046d\tb023\tLogitech MX Master Mouse\tCURSOR | EXTERNAL',
+  '/dev/input/event7\t0005\t004c\t200e\tAirPods Consumer Control\tKEYBOARD | EXTERNAL',
+  '/dev/input/event6\t0000\t0000\t0000\ttouchpanel_pen\tKEYBOARD | ALPHAKEY | DPAD | VIRTUAL',
+  '/dev/input/event4\t0000\t0000\t0000\ttouchpanel\tKEYBOARD | TOUCH | TOUCH_MT',
+].join('\n');
+
+sandbox.__devicesOutput = sampleDevicesOutput;
+vm.runInContext('parseDevices(__devicesOutput)', sandbox);
+const groupsJson = vm.runInContext('JSON.stringify(groupDevices(state.devices))', sandbox);
+const groups = JSON.parse(groupsJson);
+
+const pogoGroup = groups.find((g) => g.key === '0019|22d9|3869');
+check(pogoGroup && pogoGroup.name === 'OnePlus Pad 2 Pro Keyboard',
+  'pogo keyboard group uses keyboard name instead of earlier touchpad sibling');
+check(pogoGroup && pogoGroup.busName === '物理触点' && pogoGroup.devices.length === 2,
+  'pogo keyboard group keeps both physical endpoints under 物理触点');
+
+const btGroup = groups.find((g) => g.key === '0005|22d9|3869');
+check(btGroup && btGroup.name === 'OnePlus Pad 2 Pro Keyboard' && btGroup.busName === '蓝牙' && btGroup.devices.length === 3,
+  'bluetooth keyboard group combines keyboard, consumer control and touchpad');
+
+const zeroIdGroups = groups.filter((g) => g.devices.some((d) => d.vendor === '0000' && d.product === '0000'));
+check(zeroIdGroups.length === 2,
+  'zero vendor/product devices are not merged into a single hardware group');
+
+check(groups[0].hasSupported && !groups[groups.length - 1].hasSupported,
+  'supported device groups are sorted before unsupported-only groups');
+
+check(vm.runInContext('isUnsupportedDevice(state.devices.find((d) => d.path === "/dev/input/event8"))', sandbox) === true,
+  'mouse devices are marked unsupported for keyboard remapping');
+check(vm.runInContext('isAutoKeyboard(state.devices.find((d) => d.path === "/dev/input/event12"))', sandbox) === true,
+  'consumer control endpoint sharing bus/vendor/product with a keyboard is auto-selected');
+check(vm.runInContext('isAutoKeyboard(state.devices.find((d) => d.path === "/dev/input/event7"))', sandbox) === false,
+  'standalone consumer control without a sibling keyboard is not auto-selected');
+
+const snap1 = vm.runInContext(
+  'parseInputStatusSnapshot("GOLDCTL1\\tinput-status\\tok\\tcode=ready\\tboot_id=b\\tgeneration=10\\tinstance=0123456789abcdef0123456789abcdef\\tcount=1\\tnodes=event9\\tclaimed=event11,event9")',
+  sandbox);
+const snap2 = vm.runInContext(
+  'parseInputStatusSnapshot("GOLDCTL1\\tinput-status\\tok\\tcode=ready\\tboot_id=b\\tgeneration=11\\tinstance=0123456789abcdef0123456789abcdef\\tcount=1\\tnodes=event9\\tclaimed=event11,event9")',
+  sandbox);
+const snap3 = vm.runInContext(
+  'parseInputStatusSnapshot("GOLDCTL1\\tinput-status\\tok\\tcode=ready\\tboot_id=b\\tgeneration=12\\tinstance=0123456789abcdef0123456789abcdef\\tcount=2\\tnodes=event11,event12\\tclaimed=event11,event12")',
+  sandbox);
+check(snap1 && snap2 && snap1.signature === snap2.signature,
+  'heartbeat generation increments do not falsely trigger hotplug refreshes');
+check(snap1 && snap3 && snap1.signature !== snap3.signature,
+  'changes to nodes or claimed produce a different hotplug signature');
+
 console.log('\n' + (failures === 0 ? 'all checks passed' : 'there were failures'));
 process.exit(failures === 0 ? 0 : 1);
